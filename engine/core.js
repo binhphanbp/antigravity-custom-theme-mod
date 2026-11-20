@@ -31,10 +31,12 @@
   const PRIVATE_API_TOKEN = typeof window.__AGY_API_TOKEN__ === 'string' ? window.__AGY_API_TOKEN__ : '';
   const HAS_VAULT_DAEMON = PRIVATE_API_TOKEN.length === 64;
   let serverAuthLock = HAS_VAULT_DAEMON ? (window.__AGY_AUTH_LOCK__ !== false) : false;
+  const serverSessionUnlocked = HAS_VAULT_DAEMON ? (window.__AGY_SESSION_UNLOCKED__ === true) : true;
   let serverHasKeyChord = Boolean(window.__AGY_HAS_CHORD__);
   try {
     delete window.__AGY_API_TOKEN__;
     delete window.__AGY_AUTH_LOCK__;
+    delete window.__AGY_SESSION_UNLOCKED__;
     delete window.__AGY_HAS_CHORD__;
     // Purge any legacy client-side credential artifacts from older versions
     localStorage.removeItem('agy_auth_lock_v1');
@@ -42,11 +44,12 @@
     localStorage.removeItem('agy_auth_pass_hash_v1');
   } catch (e) {}
 
-  let sessionAuthenticated = !serverAuthLock;
-  let closureBootCompleted = false;
+  let sessionAuthenticated = !serverAuthLock || serverSessionUnlocked;
+  let closureBootCompleted = Boolean(serverAuthLock && serverSessionUnlocked);
   let isMountingBootOverlay = false;
   let tamperGuardObserver = null;
   let tamperRemountQueued = false;
+  let activeChordRecorderCleanup = null;
   let lastAdminTicket = '';
   let lastAdminTicketExp = 0;
 
@@ -99,12 +102,30 @@
       body[data-agy-mfa-locked="1"] .agy-shell,
       body[data-agy-mfa-locked="1"] .settings-modal-container,
       body[data-agy-mfa-locked="1"] #agy-custom-theme-modal-backdrop {
-        visibility: hidden !important;
+        opacity: 0 !important;
         pointer-events: none !important;
         user-select: none !important;
       }
     `;
     host.appendChild(st);
+  }
+
+  function nudgeComposerLayout() {
+    const syncOnce = () => {
+      try {
+        document.querySelectorAll('.surface-composer-card textarea').forEach((ta) => {
+          if (!ta.value && ta.style && ta.style.height && parseFloat(ta.style.height) < 26) {
+            ta.style.height = '';
+          }
+        });
+        if (typeof Event === 'function') {
+          window.dispatchEvent(new Event('resize'));
+        }
+      } catch (e) {}
+    };
+    syncOnce();
+    setTimeout(syncOnce, 90);
+    setTimeout(syncOnce, 280);
   }
 
   function enforceWorkspaceLock() {
@@ -170,6 +191,7 @@
       sh.inert = false;
       sh.removeAttribute('aria-hidden');
     });
+    nudgeComposerLayout();
   }
 
   function stopAuthCamera() {
@@ -1336,6 +1358,7 @@
 
   function scheduleRevealWhenReady(allowInstant = false) {
     window.__AGY_BOOT_FINISHED__ = true;
+    nudgeComposerLayout();
     const shell = findActiveShell();
     if (shell) {
       const liveLayer = document.getElementById('agy-live-bg-layer');
@@ -2693,6 +2716,7 @@
     let lockoutUntilEpoch = 0;
     let chordCaptureMode = false;
     let chordSteps = [];
+    let isEnrollingFace = false;
 
     function startLockoutCountdown(seconds, targetEl, restoreText) {
       const durSec = Math.max(1, Math.ceil(Number(seconds) || 30));
@@ -2778,6 +2802,7 @@
 
     async function runLiveFaceEnrollment(enrollTicket = '', fallbackUnlockProof = '') {
       pendingFaceEnroll = false;
+      isEnrollingFace = true;
       switchAuthTab('face');
       const faceStatus = document.getElementById('agy-face-status');
       const faceSub = document.getElementById('agy-face-sub');
@@ -2787,11 +2812,12 @@
       if (faceSub) faceSub.textContent = 'Sampling 4 live multi-angle biometric frames';
 
       const videoEl = document.getElementById('agy-face-video');
-      for (let w = 0; w < 16; w++) {
+      for (let w = 0; w < 18; w++) {
         if (videoEl && videoEl.readyState >= 2 && videoEl.videoWidth > 0) break;
         await new Promise((r) => setTimeout(r, 150));
       }
       if (!videoEl || videoEl.readyState < 2 || !videoEl.videoWidth) {
+        isEnrollingFace = false;
         if (faceStatus) faceStatus.textContent = 'Camera unavailable for enrollment';
         if (fallbackUnlockProof) {
           setTimeout(() => completeIdentityAuth('Passcode', fallbackUnlockProof, enrollTicket), 400);
@@ -2799,15 +2825,6 @@
           switchAuthTab('pin', 'Camera unavailable · Enter Passcode');
         }
         return;
-      }
-
-      if (window.__AGY_FACE_POLL_TIMER__) {
-        clearTimeout(window.__AGY_FACE_POLL_TIMER__);
-        window.__AGY_FACE_POLL_TIMER__ = null;
-      }
-      if (window.__AGY_FACE_FALLBACK_TIMER__) {
-        clearTimeout(window.__AGY_FACE_FALLBACK_TIMER__);
-        window.__AGY_FACE_FALLBACK_TIMER__ = null;
       }
 
       const capCanvas = document.createElement('canvas');
@@ -2823,6 +2840,7 @@
         playPinTick(980 + i * 140, 0.05);
         await new Promise((r) => setTimeout(r, 250));
       }
+      isEnrollingFace = false;
 
       try {
         const activeTicket = enrollTicket || getValidAdminTicket();
@@ -3004,6 +3022,7 @@
         videoEl.srcObject = stream;
         videoEl.play().catch(() => {});
       }
+      if (isEnrollingFace) return;
       if (faceStatus) faceStatus.textContent = 'Scanning live biometric signature...';
 
       let darkStreak = 0;
@@ -3222,7 +3241,9 @@
         const passInput = document.getElementById('agy-term-pass');
         if (passInput) {
           passInput.value = '';
-          setTimeout(() => passInput.focus(), 40);
+          setTimeout(() => {
+            if (activeAuthTab === 'term') passInput.focus();
+          }, 40);
         }
       }
     }
@@ -3556,6 +3577,14 @@
           return;
         }
         if ((e.ctrlKey || e.metaKey || e.altKey) && !chordCaptureMode) {
+          if (currentStage === 2 && e.altKey && !e.ctrlKey && !e.metaKey && ['1', '2', '3', '4'].includes(e.key)) {
+            e.preventDefault();
+            e.stopPropagation();
+            const tabs = ['face', 'pin', 'hello', 'term'];
+            pendingFaceEnroll = false;
+            switchAuthTab(tabs[Number(e.key) - 1]);
+            return;
+          }
           const k = String(e.key || '').toLowerCase();
           const allowInputEdit = document.activeElement === termPassInput && (e.ctrlKey || e.metaKey) && ['a', 'v', 'c', 'x', 'backspace'].includes(k);
           if (!allowInputEdit) {
@@ -3606,11 +3635,11 @@
           return;
         }
 
-        if (activeAuthTab === 'pin' && e.key === 'Backspace') {
+        if (activeAuthTab === 'pin' && (e.key === 'Backspace' || e.key === 'Delete')) {
           e.preventDefault();
           e.stopPropagation();
-          pinBuffer = pinBuffer.slice(0, -1);
-          playPinTick(620, 0.04);
+          pinBuffer = e.key === 'Delete' ? '' : pinBuffer.slice(0, -1);
+          playPinTick(e.key === 'Delete' ? 520 : 620, 0.04);
           renderPinOrbs();
           return;
         }
@@ -4381,6 +4410,12 @@
         border: ${bubbleTheme.innerBorder || '1px solid rgba(255, 255, 255, 0.07)'} !important;
       }
 
+      /* Prevent placeholder/model-toolbar overlap on initial boot while preserving outer metallic gradient */
+      .surface-composer-card > :has(+ [data-testid="input-box-bottom-toolbar"]) {
+        min-height: 38px !important;
+        box-sizing: border-box !important;
+      }
+
       /* High-contrast pill badges for top composer bar (adaptive light/dark theme) */
       .surface-composer [data-testid="project-selector-trigger"],
       .surface-composer [data-testid="branch-pill-trigger"],
@@ -4491,10 +4526,12 @@
         font-size: 15.2px !important;
         line-height: 1.68 !important;
       }
-      .agy-shell .surface-composer textarea,
+      .agy-shell .surface-composer textarea:not(.inputarea),
       .agy-shell .surface-composer [contenteditable="true"] {
         font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI Variable Text', 'Segoe UI', sans-serif !important;
         font-size: 15px !important;
+        line-height: 1.5 !important;
+        min-height: 26px !important;
       }
       .agy-shell :is(pre, code, kbd, samp),
       .agy-shell [class*="font-mono"] {
@@ -4627,6 +4664,15 @@
     document.addEventListener('DOMContentLoaded', bootstrapEngineDom, { once: true });
   }
 
+  function closeCustomThemeModal() {
+    if (typeof activeChordRecorderCleanup === 'function') {
+      try { activeChordRecorderCleanup(); } catch (e) {}
+      activeChordRecorderCleanup = null;
+    }
+    const backdrop = document.getElementById('agy-custom-theme-modal-backdrop');
+    if (backdrop) backdrop.style.display = 'none';
+  }
+
   function openCustomThemeModal() {
     let backdrop = document.getElementById('agy-custom-theme-modal-backdrop');
     if (!backdrop) {
@@ -4640,18 +4686,18 @@
         align-items: center;
         justify-content: center;
         padding: 32px;
-        background: rgba(0, 0, 0, 0.65);
+        background: rgba(5, 4, 12, 0.72);
         backdrop-filter: blur(10px);
       `;
 
       backdrop.innerHTML = `
-        <div id="agy-custom-theme-modal-dialog" style="background: rgba(16, 12, 11, 0.97); border: 1.2px solid rgba(212, 148, 106, 0.35); border-radius: 18px; width: 100%; max-width: 900px; height: 86vh; max-height: 860px; display: flex; flex-direction: column; overflow: hidden; box-shadow: 0 24px 64px rgba(0, 0, 0, 0.9), 0 0 32px rgba(224, 142, 85, 0.25); font-family: system-ui, -apple-system, sans-serif;">
-          <div id="agy-custom-theme-modal-header" style="display: flex; justify-content: space-between; align-items: center; padding: 18px 26px; border-bottom: 1px solid rgba(255, 255, 255, 0.08); background: rgba(22, 16, 14, 0.85);">
+        <div id="agy-custom-theme-modal-dialog" style="background: rgba(11, 8, 22, 0.97); border: 1.2px solid rgba(192, 132, 252, 0.36); border-radius: 18px; width: 100%; max-width: 900px; height: 86vh; max-height: 860px; display: flex; flex-direction: column; overflow: hidden; box-shadow: 0 24px 64px rgba(0, 0, 0, 0.9), 0 0 32px rgba(168, 85, 247, 0.24); font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;">
+          <div id="agy-custom-theme-modal-header" style="display: flex; justify-content: space-between; align-items: center; padding: 18px 26px; border-bottom: 1px solid rgba(255, 255, 255, 0.08); background: rgba(20, 14, 36, 0.90);">
             <div style="display: flex; align-items: center; gap: 10px;">
-              <span style="font-size: 17px; font-weight: 600; color: #f4f4f5; letter-spacing: -0.2px;">Custom Theme Studio</span>
-              <span id="agy-custom-theme-badge" style="font-size: 11.5px; padding: 2.5px 9px; border-radius: 9999px; background: rgba(224, 142, 85, 0.2); color: #e08e55; font-weight: 500; border: 1px solid rgba(224, 142, 85, 0.3);">${THEME_KEYS.length} Preset${THEME_KEYS.length > 1 ? 's' : ''}</span>
+              <span style="font-size: 17px; font-weight: 700; color: #f4f4f5; letter-spacing: -0.02em;">Custom Theme Studio</span>
+              <span id="agy-custom-theme-badge" style="font-size: 11.5px; padding: 2.5px 10px; border-radius: 9999px; background: rgba(168, 85, 247, 0.18); color: #e9d5ff; font-weight: 600; border: 1px solid rgba(192, 132, 252, 0.34);">${THEME_KEYS.length} Preset${THEME_KEYS.length > 1 ? 's' : ''}</span>
             </div>
-            <button id="agy-theme-modal-close-btn" type="button" style="background: rgba(255, 255, 255, 0.06); border: 1px solid rgba(255, 255, 255, 0.1); color: #d4d4d8; cursor: pointer; width: 30px; height: 30px; border-radius: 8px; font-size: 15px; display: flex; align-items: center; justify-content: center; transition: all 0.15s ease;">✕</button>
+            <button id="agy-theme-modal-close-btn" type="button" style="background: rgba(255, 255, 255, 0.06); border: 1px solid rgba(255, 255, 255, 0.12); color: #d4d4d8; cursor: pointer; width: 30px; height: 30px; border-radius: 8px; font-size: 15px; display: flex; align-items: center; justify-content: center; transition: all 0.15s ease;">✕</button>
           </div>
           <div id="agy-theme-modal-body" style="flex: 1; overflow-y: auto; height: 100%;"></div>
         </div>
@@ -4660,14 +4706,14 @@
       document.body.appendChild(backdrop);
 
       backdrop.addEventListener('click', (e) => {
-        if (e.target === backdrop) backdrop.style.display = 'none';
+        if (e.target === backdrop) closeCustomThemeModal();
       });
       backdrop.querySelector('#agy-theme-modal-close-btn').addEventListener('click', () => {
-        backdrop.style.display = 'none';
+        closeCustomThemeModal();
       });
       window.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape' && backdrop.style.display !== 'none') {
-          backdrop.style.display = 'none';
+        if (e.key === 'Escape' && backdrop.style.display !== 'none' && !activeChordRecorderCleanup) {
+          closeCustomThemeModal();
         }
       });
     }
@@ -4707,11 +4753,11 @@
                 <span id="agy-blur-val" style="min-width: 30px; text-align: right;">${st.glassBlur}px</span>
               </label>
               <div style="display: inline-flex; border-radius: 8px; overflow: hidden; border: 1px solid ${mainTheme.borderColor}; background: rgba(0,0,0,0.28);">
-                <button id="agy-mode-image" type="button" style="padding: 4px 10px; font-size: 11.5px; cursor: pointer; border: none; background: ${st.wpMode === 'image' ? 'rgba(255,255,255,0.18)' : 'transparent'}; color: ${st.wpMode === 'image' ? '#ffffff' : '#a1a1aa'}; font-weight: ${st.wpMode === 'image' ? '600' : '400'};">Ảnh tĩnh</button>
-                <button id="agy-mode-video" type="button" style="padding: 4px 10px; font-size: 11.5px; cursor: pointer; border: none; border-left: 1px solid ${mainTheme.borderColor}; background: ${st.wpMode === 'video' ? 'rgba(255,255,255,0.18)' : 'transparent'}; color: ${st.wpMode === 'video' ? '#ffffff' : '#a1a1aa'}; font-weight: ${st.wpMode === 'video' ? '600' : '400'};">Video động</button>
+                <button id="agy-mode-image" type="button" style="padding: 4px 10px; font-size: 11.5px; cursor: pointer; border: none; background: ${st.wpMode === 'image' ? 'rgba(255,255,255,0.18)' : 'transparent'}; color: ${st.wpMode === 'image' ? '#ffffff' : '#a1a1aa'}; font-weight: ${st.wpMode === 'image' ? '600' : '400'};">Static Image</button>
+                <button id="agy-mode-video" type="button" style="padding: 4px 10px; font-size: 11.5px; cursor: pointer; border: none; border-left: 1px solid ${mainTheme.borderColor}; background: ${st.wpMode === 'video' ? 'rgba(255,255,255,0.18)' : 'transparent'}; color: ${st.wpMode === 'video' ? '#ffffff' : '#a1a1aa'}; font-weight: ${st.wpMode === 'video' ? '600' : '400'};">Live Video</button>
               </div>
               <label style="padding: 5px 10px; border-radius: 8px; background: rgba(255, 255, 255, 0.08); border: 1px solid ${mainTheme.borderColor}; color: #f4f4f5; font-size: 12px; cursor: pointer; white-space: nowrap;">
-                Chọn Ảnh / Video
+                Upload Media
                 <input id="agy-wp-upload" type="file" accept="image/*,video/mp4,video/webm,video/quicktime,video/*" style="display: none;" />
               </label>
               <button id="agy-export-btn" type="button" style="padding: 5px 10px; border-radius: 8px; background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.16); color: #f4f4f5; font-size: 12px; cursor: pointer; white-space: nowrap;">
@@ -4729,63 +4775,63 @@
             <div style="display: flex; align-items: center; gap: 14px; flex-wrap: wrap;">
               <label style="display: flex; align-items: center; gap: 6px; font-size: 12px; color: #d4d4d8; cursor: pointer;">
                 <input id="agy-boot-toggle" type="checkbox" ${st.bootIntro ? 'checked' : ''} style="accent-color: ${mainTheme.primary}; cursor: pointer;" />
-                Boot Intro + Tawa Voice
+                Boot Intro &amp; Studio Audio
               </label>
               <label style="display: flex; align-items: center; gap: 6px; font-size: 12px; color: #d4d4d8; cursor: pointer;">
                 <input id="agy-sketch-toggle" type="checkbox" ${st.sketchReveal ? 'checked' : ''} style="accent-color: ${mainTheme.primary}; cursor: pointer;" />
-                Vẽ nét → Loang màu
+                Sketch → Bloom Reveal
               </label>
               <label style="display: flex; align-items: center; gap: 6px; font-size: 12px; color: #d4d4d8; cursor: pointer;">
                 <input id="agy-greeting-toggle" type="checkbox" ${st.tawaGreeting ? 'checked' : ''} style="accent-color: ${mainTheme.primary}; cursor: pointer;" />
-                Câu chào Custom
+                Custom Greeting
               </label>
               <label style="display: flex; align-items: center; gap: 6px; font-size: 12px; color: #d4d4d8; cursor: pointer;">
                 <input id="agy-task-voice-toggle" type="checkbox" ${st.taskVoiceEnabled ? 'checked' : ''} style="accent-color: ${mainTheme.primary}; cursor: pointer;" />
-                Voice xong Task
+                Task Audio
               </label>
-              <span id="agy-upload-status" style="font-size: 11.5px; color: #93c5fd;"></span>
+              <span id="agy-upload-status" style="font-size: 11.5px; color: #c4b5fd;"></span>
             </div>
             <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
               <button id="agy-custom-vg-toggle" type="button" style="padding: 4px 10px; border-radius: 7px; background: rgba(255,255,255,0.08); border: 1px solid ${mainTheme.borderColor}; color: #e4e4e7; font-size: 11.5px; cursor: pointer;">
-                Tùy chỉnh Voice &amp; Câu chào ▾
+                Audio &amp; Greeting Studio ▾
               </button>
               <button id="agy-replay-boot-btn" type="button" style="padding: 4px 10px; border-radius: 7px; background: rgba(255,255,255,0.08); border: 1px solid ${mainTheme.borderColor}; color: #e4e4e7; font-size: 11.5px; cursor: pointer;">
                 Replay Intro
               </button>
               <button id="agy-replay-reveal-btn" type="button" style="padding: 4px 10px; border-radius: 7px; background: rgba(255,255,255,0.08); border: 1px solid ${mainTheme.borderColor}; color: #e4e4e7; font-size: 11.5px; cursor: pointer;">
-                Replay Vẽ Nền
+                Replay Reveal
               </button>
             </div>
           </div>
           <div id="agy-custom-vg-box" style="display: none; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.08);">
             <div style="display: flex; flex-direction: column; gap: 8px; background: rgba(0,0,0,0.25); border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; padding: 12px;">
               <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;">
-                <span style="font-size: 12.5px; font-weight: 600; color: #f4f4f5;">Voice báo xong Task (Random)</span>
+                <span style="font-size: 12.5px; font-weight: 600; color: #f4f4f5;">Task Completion Audio (Random)</span>
                 <div style="display: flex; align-items: center; gap: 6px;">
-                  <button id="agy-task-voice-test" type="button" title="Nghe thử ngẫu nhiên" style="padding: 4px 8px; border-radius: 7px; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.14); color: #e4e4e7; font-size: 11.5px; cursor: pointer;">🎲 Test</button>
+                  <button id="agy-task-voice-test" type="button" title="Preview random audio" style="padding: 4px 8px; border-radius: 7px; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.14); color: #e4e4e7; font-size: 11.5px; cursor: pointer;">🎲 Test</button>
                   <label style="padding: 4px 9px; border-radius: 7px; background: rgba(255, 255, 255, 0.08); border: 1px solid ${mainTheme.borderColor}; color: #f4f4f5; font-size: 11.5px; cursor: pointer; white-space: nowrap;">
-                    Thêm Voice
+                    Add Audio
                     <input id="agy-task-voice-upload" type="file" multiple accept="audio/*,.mp3,.wav,.ogg,.m4a,.aac,.flac" style="display: none;" />
                   </label>
                 </div>
               </div>
               <div style="display: flex; align-items: center; gap: 8px;">
-                <span style="font-size: 11.5px; color: #a1a1aa;">Âm lượng</span>
+                <span style="font-size: 11.5px; color: #a1a1aa;">Volume</span>
                 <input id="agy-task-voice-vol" type="range" min="0" max="100" value="${st.taskVoiceVol}" style="flex: 1; cursor: pointer; accent-color: ${mainTheme.primary}; height: 5px;" />
                 <span id="agy-task-voice-vol-val" style="min-width: 34px; text-align: right; font-size: 11.5px; color: #d4d4d8;">${st.taskVoiceVol}%</span>
               </div>
               <div id="agy-task-voice-list" style="display: flex; flex-direction: column; gap: 5px; max-height: 112px; overflow-y: auto;"></div>
-              <div style="font-size: 11px; color: #71717a;">Chỉ tạo Audio khi tác vụ vừa xong rồi tự hủy (0 MB RAM khi rảnh).</div>
+              <div style="font-size: 11px; color: #71717a;">Plays once on task completion and releases decoder immediately (0 MB idle RAM).</div>
             </div>
             <div style="display: flex; flex-direction: column; gap: 8px; background: rgba(0,0,0,0.25); border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; padding: 12px;">
               <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px;">
-                <span style="font-size: 12.5px; font-weight: 600; color: #f4f4f5;">Câu chào Custom (mỗi dòng 1 câu)</span>
-                <span id="agy-greeting-msg" style="font-size: 11px; color: #93c5fd;"></span>
+                <span style="font-size: 12.5px; font-weight: 600; color: #f4f4f5;">Custom Greeting Pool (one line per greeting)</span>
+                <span id="agy-greeting-msg" style="font-size: 11px; color: #c4b5fd;"></span>
               </div>
-              <textarea id="agy-greeting-lines" rows="4" placeholder="Nhập câu chào riêng của bạn (mỗi dòng 1 câu)..." style="width: 100%; box-sizing: border-box; background: rgba(0,0,0,0.38); color: #f4f4f5; border: 1px solid ${mainTheme.borderColor}; border-radius: 7px; padding: 7px 9px; font-size: 12px; resize: vertical; line-height: 1.45;">${escapeHtml((st.customGreetings || []).join('\n'))}</textarea>
+              <textarea id="agy-greeting-lines" rows="4" placeholder="Enter custom empty-state greetings (one line each)..." style="width: 100%; box-sizing: border-box; background: rgba(0,0,0,0.38); color: #f4f4f5; border: 1px solid ${mainTheme.borderColor}; border-radius: 7px; padding: 7px 9px; font-size: 12px; resize: vertical; line-height: 1.45;">${escapeHtml((st.customGreetings || []).join('\n'))}</textarea>
               <div style="display: flex; justify-content: flex-end; gap: 8px;">
-                <button id="agy-greeting-reset" type="button" style="padding: 4px 10px; border-radius: 7px; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.14); color: #d4d4d8; font-size: 11.5px; cursor: pointer;">Xóa hết</button>
-                <button id="agy-greeting-save" type="button" style="padding: 4px 12px; border-radius: 7px; background: ${mainTheme.primary}; color: #090d16; font-weight: 600; font-size: 11.5px; border: none; cursor: pointer;">Lưu câu chào</button>
+                <button id="agy-greeting-reset" type="button" style="padding: 4px 10px; border-radius: 7px; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.14); color: #d4d4d8; font-size: 11.5px; cursor: pointer;">Clear All</button>
+                <button id="agy-greeting-save" type="button" style="padding: 4px 12px; border-radius: 7px; background: ${mainTheme.primary}; color: #090d16; font-weight: 600; font-size: 11.5px; border: none; cursor: pointer;">Save Greetings</button>
               </div>
             </div>
           </div>
@@ -4848,6 +4894,9 @@
                 <input id="agy-auth-lock-toggle" type="checkbox" ${st.authLock ? 'checked' : ''} style="accent-color: ${mainTheme.primary}; cursor: pointer;" />
                 Require MFA on Boot
               </label>
+              <button id="agy-mfa-lock-now-btn" type="button" style="padding: 5px 11px; border-radius: 8px; background: linear-gradient(135deg, #9333ea 0%, #6b21a8 100%); border: 1px solid rgba(233, 213, 255, 0.35); color: #ffffff; font-size: 12px; font-weight: 600; cursor: pointer;">
+                Lock Now
+              </button>
               <button id="agy-mfa-test-btn" type="button" style="padding: 5px 11px; border-radius: 8px; background: rgba(168, 85, 247, 0.18); border: 1px solid ${mainTheme.borderColor}; color: #f3e8ff; font-size: 12px; font-weight: 600; cursor: pointer;">
                 Test Lock Screen
               </button>
@@ -4891,7 +4940,7 @@
               const stickerW = Math.round((th.stickerW || 0) * 0.78);
               const stickerH = th.isOrnament ? Math.round((th.stickerH || 0) * 0.8) : Math.round((th.stickerH || 0) * 0.78);
               return `
-                <div class="agy-bubble-card" data-name="${name}" style="position: relative; border-radius: 12px; border: ${isSelected ? '1.5px solid #f4f4f5' : '1px solid rgba(255, 255, 255, 0.12)'}; background: ${isSelected ? 'rgba(42, 34, 30, 0.68)' : 'rgba(14, 12, 12, 0.78)'}; padding: 24px 18px 14px 18px; cursor: pointer; display: flex; flex-direction: column; justify-content: space-between; min-height: 112px; transition: border-color 0.15s ease, background-color 0.15s ease;">
+                <div class="agy-bubble-card" data-name="${name}" style="position: relative; border-radius: 12px; border: ${isSelected ? '1.5px solid #e9d5ff' : '1px solid rgba(255, 255, 255, 0.12)'}; background: ${isSelected ? (mainTheme.cardSelectedBg || 'rgba(46, 24, 78, 0.72)') : 'rgba(14, 12, 18, 0.78)'}; padding: 24px 18px 14px 18px; cursor: pointer; display: flex; flex-direction: column; justify-content: space-between; min-height: 112px; transition: border-color 0.15s ease, background-color 0.15s ease;">
                   <div style="display: flex; justify-content: center; align-items: center; width: 100%; margin-top: 6px; margin-bottom: 10px;">
                     <div style="position: relative; width: 192px; height: 46px; padding: 1.2px; border-radius: ${th.isScroll ? '6px' : '12px'}; background: ${th.frameBg}; box-shadow: 0 4px 14px rgba(0,0,0,0.45), 0 0 10px ${th.glow};">
                       <div style="position: relative; width: 100%; height: 100%; background: ${th.bg}; border: ${th.innerBorder || '1px solid ' + th.borderColor}; border-radius: ${th.isScroll ? '4px' : '11px'}; display: flex; align-items: center; padding: 0 16px;">
@@ -4924,8 +4973,8 @@
                 ? (activeBubbleTh.inputGlassBg || 'rgba(20, 15, 13, 0.45)')
                 : (activeBubbleTh.inputCardBg || 'rgba(26, 18, 15, 0.92)');
               return `
-                <div class="agy-input-card" data-style="${key}" style="border-radius: 12px; border: ${isSelected ? '1.5px solid #f4f4f5' : '1px solid rgba(255, 255, 255, 0.12)'}; background: ${isSelected ? 'rgba(42, 34, 30, 0.68)' : 'rgba(14, 12, 12, 0.78)'}; padding: 16px 18px; cursor: pointer; display: flex; flex-direction: column; gap: 12px; transition: border-color 0.15s ease, background-color 0.15s ease;">
-                  <div class="agy-input-preview-outer" style="position: relative; margin-top: 8px; padding: 1.5px; border-radius: 10px; background: ${key === 'double_gold' ? 'linear-gradient(135deg, #f59e0b, #fbbf24)' : activeBubbleTh.frameBg};">
+                <div class="agy-input-card" data-style="${key}" style="border-radius: 12px; border: ${isSelected ? '1.5px solid #e9d5ff' : '1px solid rgba(255, 255, 255, 0.12)'}; background: ${isSelected ? (mainTheme.cardSelectedBg || 'rgba(46, 24, 78, 0.72)') : 'rgba(14, 12, 18, 0.78)'}; padding: 16px 18px; cursor: pointer; display: flex; flex-direction: column; gap: 12px; transition: border-color 0.15s ease, background-color 0.15s ease;">
+                  <div class="agy-input-preview-outer" style="position: relative; margin-top: 8px; padding: 1.5px; border-radius: 10px; background: ${key === 'double_gold' ? 'linear-gradient(135deg, #f3e8ff 0%, #c084fc 45%, #7e22ce 75%, #e879f9 100%)' : activeBubbleTh.frameBg};">
                     <div class="agy-input-preview-sticker" style="position: absolute; ${previewStickerStyle} background-image: url('${activeBubbleTh.sticker || ''}'); background-size: contain; background-repeat: no-repeat; display: ${key !== 'minimal' && activeBubbleTh.sticker ? 'block' : 'none'}; pointer-events: none;"></div>
                     <div class="agy-input-preview-inner" style="background: ${previewInnerBg}; border-radius: 9px; padding: 8px 12px; font-size: 12px; color: #a1a1aa; display: flex; justify-content: space-between; align-items: center;">
                       <span>Ask anything, @ to mention...</span>
@@ -4956,7 +5005,7 @@
         const outer = card.querySelector('.agy-input-preview-outer');
         if (outer) {
           outer.style.background = key === 'double_gold'
-            ? 'linear-gradient(135deg, #f59e0b, #fbbf24)'
+            ? 'linear-gradient(135deg, #f3e8ff 0%, #c084fc 45%, #7e22ce 75%, #e879f9 100%)'
             : activeTh.frameBg;
         }
         const inner = card.querySelector('.agy-input-preview-inner');
@@ -5038,7 +5087,7 @@
         syncModeButtons('video');
         if (wpToggle) wpToggle.checked = true;
         if (uploadStatus) {
-          uploadStatus.textContent = hasVid ? '' : 'Hãy chọn Furina Live hoặc một Video đã lưu bên dưới';
+          uploadStatus.textContent = hasVid ? '' : 'Select a Live Video preset or upload an MP4/WebM video below';
         }
         renderPresetsSection();
       });
@@ -5063,8 +5112,7 @@
       });
     }
     function closeHostModalsForPreview() {
-      const bd = document.getElementById('agy-custom-theme-modal-backdrop');
-      if (bd) bd.style.display = 'none';
+      closeCustomThemeModal();
       const settingsBox = document.querySelector('.settings-modal-container');
       if (settingsBox) {
         const sr = settingsBox.getBoundingClientRect();
@@ -5136,7 +5184,7 @@
       if (!file) return;
       const isVideo = (file.type && file.type.startsWith('video/')) || /\.(mp4|webm|mov|m4v)$/i.test(file.name || '');
       const kind = isVideo ? 'video' : 'image';
-      if (uploadStatus) uploadStatus.textContent = isVideo ? 'Đang nạp video...' : 'Đang nạp ảnh nền...';
+      if (uploadStatus) uploadStatus.textContent = isVideo ? 'Uploading video...' : 'Uploading wallpaper...';
 
       const uploaded = await uploadMediaToServer(file, isVideo ? 'custom.mp4' : 'custom.png');
       let mediaUrl = uploaded && uploaded.url ? uploaded.url : '';
@@ -5157,7 +5205,7 @@
 
       wpUpload.value = '';
       if (!mediaUrl) {
-        if (uploadStatus) uploadStatus.textContent = 'Không đọc được tệp đã chọn!';
+        if (uploadStatus) uploadStatus.textContent = 'Could not read selected file!';
         return;
       }
 
@@ -5170,11 +5218,11 @@
       if (isVideo) {
         applyTheme({ wpMode: 'video', customVideo: mediaUrl, savedVideos: nextList, wpEnabled: true });
         syncModeButtons('video');
-        if (uploadStatus) uploadStatus.textContent = uploaded && uploaded.duplicate ? 'Đã chọn lại video đã lưu!' : 'Đã lưu & cập nhật video nền!';
+        if (uploadStatus) uploadStatus.textContent = uploaded && uploaded.duplicate ? 'Selected existing saved video!' : 'Video saved & applied!';
       } else {
         applyTheme({ wpMode: 'image', customWp: mediaUrl, savedImages: nextList, wpEnabled: true });
         syncModeButtons('image');
-        if (uploadStatus) uploadStatus.textContent = uploaded && uploaded.duplicate ? 'Đã chọn lại ảnh đã lưu!' : 'Đã lưu & cập nhật ảnh nền!';
+        if (uploadStatus) uploadStatus.textContent = uploaded && uploaded.duplicate ? 'Selected existing saved image!' : 'Wallpaper saved & applied!';
       }
       if (wpToggle) wpToggle.checked = true;
       renderPresetsSection();
@@ -5219,6 +5267,7 @@
     }
 
     const authLockToggle = container.querySelector('#agy-auth-lock-toggle');
+    const mfaLockNowBtn = container.querySelector('#agy-mfa-lock-now-btn');
     const mfaTestBtn = container.querySelector('#agy-mfa-test-btn');
     const faceResetBtn = container.querySelector('#agy-face-reset-btn');
     const curPinAuthInput = container.querySelector('#agy-cur-pin-auth');
@@ -5312,10 +5361,29 @@
         }
       });
     }
+    if (mfaLockNowBtn) {
+      mfaLockNowBtn.addEventListener('click', async () => {
+        closeHostModalsForPreview();
+        try {
+          await daemonFetch('/auth/lock-now', { method: 'POST' });
+        } catch (e) {}
+        sessionAuthenticated = false;
+        mountBootSequence(true, true);
+      });
+    }
     if (mfaTestBtn) {
       mfaTestBtn.addEventListener('click', () => {
         closeHostModalsForPreview();
         mountBootSequence(true, true);
+      });
+    }
+    if (curPinAuthInput) {
+      curPinAuthInput.addEventListener('keydown', async (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          const ticket = await ensureAdminTicket();
+          if (ticket) showMfaMsg('Session authorized for 5 minutes. You can now update vault settings.', false);
+        }
       });
     }
     if (faceResetBtn) {
@@ -5341,7 +5409,7 @@
       });
     }
     if (savePinBtn && newPinInput) {
-      savePinBtn.addEventListener('click', async () => {
+      const triggerSavePin = async () => {
         const raw = newPinInput.value.trim();
         if (!/^\d{6}$/.test(raw)) {
           showMfaMsg('New PIN must be exactly 6 digits (0-9).', true);
@@ -5349,10 +5417,14 @@
         }
         const ok = await applyVaultPatch({ newPin: raw }, '6-digit Passcode updated (scrypt vault saved).');
         if (ok) newPinInput.value = '';
+      };
+      savePinBtn.addEventListener('click', triggerSavePin);
+      newPinInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); triggerSavePin(); }
       });
     }
     if (savePassBtn && newPassInput) {
-      savePassBtn.addEventListener('click', async () => {
+      const triggerSavePass = async () => {
         const raw = newPassInput.value;
         if (!raw || raw.length < 4) {
           showMfaMsg('Passphrase must be at least 4 characters.', true);
@@ -5360,21 +5432,37 @@
         }
         const ok = await applyVaultPatch({ newPass: raw }, 'Engineer Terminal passphrase updated (scrypt vault saved).');
         if (ok) newPassInput.value = '';
+      };
+      savePassBtn.addEventListener('click', triggerSavePass);
+      newPassInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); triggerSavePass(); }
       });
     }
     if (recordChordBtn) {
       recordChordBtn.addEventListener('click', async () => {
+        if (typeof activeChordRecorderCleanup === 'function') {
+          activeChordRecorderCleanup();
+          activeChordRecorderCleanup = null;
+        }
         const ticket = await ensureAdminTicket();
         if (!ticket) return;
         const recorded = [];
         recordChordBtn.textContent = 'Press Combo 1/3...';
         showMfaMsg('Press 3 secret key combinations (Esc to cancel)...', false);
+        const cleanupRec = () => {
+          window.removeEventListener('keydown', onRecKey, true);
+          if (activeChordRecorderCleanup === cleanupRec) {
+            activeChordRecorderCleanup = null;
+          }
+          if (recordChordBtn) {
+            recordChordBtn.textContent = serverHasKeyChord ? 'Update 3-Key Chord' : 'Record 3-Key Chord';
+          }
+        };
         const onRecKey = async (ev) => {
           if (ev.key === 'Escape') {
             ev.preventDefault();
             ev.stopPropagation();
-            window.removeEventListener('keydown', onRecKey, true);
-            recordChordBtn.textContent = serverHasKeyChord ? 'Update 3-Key Chord' : 'Record 3-Key Chord';
+            cleanupRec();
             showMfaMsg('Key chord recording cancelled.', true);
             return;
           }
@@ -5387,9 +5475,10 @@
             recordChordBtn.textContent = `Press Combo ${recorded.length + 1}/3...`;
             return;
           }
-          window.removeEventListener('keydown', onRecKey, true);
+          cleanupRec();
           await applyVaultPatch({ newChord: recorded.join('>') }, `3-Step Secret Key Chord saved (${recorded.join(' -> ')}).`);
         };
+        activeChordRecorderCleanup = cleanupRec;
         window.addEventListener('keydown', onRecKey, true);
       });
     }
@@ -5502,11 +5591,32 @@
     }
 
     const resetBtn = container.querySelector('#agy-reset-btn');
+    let resetArmed = false;
+    let resetArmTimer = null;
     resetBtn.addEventListener('click', () => {
+      if (!resetArmed) {
+        resetArmed = true;
+        resetBtn.textContent = 'Confirm Reset?';
+        resetBtn.style.background = 'rgba(220, 38, 38, 0.34)';
+        clearTimeout(resetArmTimer);
+        resetArmTimer = setTimeout(() => {
+          resetArmed = false;
+          if (resetBtn) {
+            resetBtn.textContent = 'Reset';
+            resetBtn.style.background = 'rgba(239, 68, 68, 0.14)';
+          }
+        }, 3200);
+        return;
+      }
+      resetArmed = false;
+      clearTimeout(resetArmTimer);
+      resetBtn.textContent = 'Reset';
+      resetBtn.style.background = 'rgba(239, 68, 68, 0.14)';
+
+      const preservedUserAv = getState().userAvatar;
       localStorage.removeItem(STORAGE_CUSTOM_WP);
       localStorage.removeItem(STORAGE_CUSTOM_VIDEO);
       localStorage.removeItem(STORAGE_WP_MODE);
-      localStorage.removeItem(STORAGE_USER_AVATAR);
       localStorage.removeItem(STORAGE_AGENT_AVATAR);
       localStorage.removeItem(STORAGE_GLASS_BLUR);
       localStorage.removeItem(STORAGE_AVATAR_SIZE);
@@ -5524,6 +5634,7 @@
       localStorage.removeItem(STORAGE_CUSTOM_GREETINGS);
       const defTh = THEMES[DEFAULT_THEME_KEY] || {};
       const defMode = defTh.wallpaperVideo ? 'video' : 'image';
+      const selCardBg = defTh.cardSelectedBg || 'rgba(46, 24, 78, 0.72)';
       applyTheme({
         themeName: DEFAULT_THEME_KEY,
         bubbleName: DEFAULT_THEME_KEY,
@@ -5536,7 +5647,7 @@
         taskVoiceEnabled: true,
         taskVoiceVol: 85,
         customGreetings: [],
-        userAvatar: '',
+        userAvatar: preservedUserAv,
         agentAvatar: '',
         glassBlur: 3,
         avatarSize: 32,
@@ -5556,8 +5667,9 @@
       renderTaskVoiceList();
       window.__AGY_GREETING_NEED_FRESH__ = true;
       syncEmptyGreeting();
-      if (uploadStatus) uploadStatus.textContent = '';
-      syncAvPreview(userAvPreview, defTh.userAvatar || '', 'U');
+      if (uploadStatus) uploadStatus.textContent = 'Defaults restored (User Avatar preserved).';
+      const effResetUserAv = preservedUserAv === 'none' ? '' : (preservedUserAv || defTh.userAvatar || '');
+      syncAvPreview(userAvPreview, effResetUserAv, 'U');
       syncAvPreview(agentAvPreview, defTh.agentAvatar || '', 'AI');
       if (userAvPreview) userAvPreview.style.borderRadius = '50%';
       if (agentAvPreview) agentAvPreview.style.borderRadius = '50%';
@@ -5574,15 +5686,15 @@
       renderPresetsSection();
       container.querySelectorAll('.agy-bubble-card').forEach(b => {
         const isSel = b.dataset.name === DEFAULT_THEME_KEY;
-        b.style.border = isSel ? '1.5px solid #f4f4f5' : '1px solid rgba(255, 255, 255, 0.12)';
-        b.style.background = isSel ? 'rgba(42, 34, 30, 0.68)' : 'rgba(14, 12, 12, 0.78)';
+        b.style.border = isSel ? '1.5px solid #e9d5ff' : '1px solid rgba(255, 255, 255, 0.12)';
+        b.style.background = isSel ? selCardBg : 'rgba(14, 12, 18, 0.78)';
         const slot = b.querySelector('.agy-card-check-slot');
         if (slot) slot.innerHTML = isSel ? CHECK_SVG : '';
       });
       container.querySelectorAll('.agy-input-card').forEach(c => {
         const isSel = c.dataset.style === 'sync';
-        c.style.border = isSel ? '1.5px solid #f4f4f5' : '1px solid rgba(255, 255, 255, 0.12)';
-        c.style.background = isSel ? 'rgba(42, 34, 30, 0.68)' : 'rgba(14, 12, 12, 0.78)';
+        c.style.border = isSel ? '1.5px solid #e9d5ff' : '1px solid rgba(255, 255, 255, 0.12)';
+        c.style.background = isSel ? selCardBg : 'rgba(14, 12, 18, 0.78)';
         const slot = c.querySelector('.agy-card-check-slot');
         if (slot) slot.innerHTML = isSel ? CHECK_SVG : '';
       });
@@ -5606,15 +5718,15 @@
       if (!taskVoiceListEl) return;
       const voices = getMediaLibrary('audio');
       if (voices.length === 0) {
-        taskVoiceListEl.innerHTML = `<div style="font-size: 11.5px; color: #71717a; padding: 6px 2px;">Chưa có file voice nào. Bấm "Thêm Voice" để nạp 1 hoặc nhiều file .mp3/.wav/.ogg/.m4a.</div>`;
+        taskVoiceListEl.innerHTML = `<div style="font-size: 11.5px; color: #71717a; padding: 6px 2px;">No custom audio files added yet. Click "Add Audio" to upload .mp3/.wav/.ogg/.m4a chimes.</div>`;
         return;
       }
       taskVoiceListEl.innerHTML = voices.map((v, idx) => `
         <div style="display: flex; align-items: center; gap: 6px; padding: 4px 8px; border-radius: 7px; border: 1px solid rgba(255,255,255,0.10); background: rgba(255,255,255,0.03);">
-          <span style="font-size: 10.5px; color: #93c5fd; min-width: 16px;">#${idx + 1}</span>
+          <span style="font-size: 10.5px; color: #c4b5fd; min-width: 16px;">#${idx + 1}</span>
           <span style="flex: 1; font-size: 11.5px; color: #e4e4e7; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${escapeHtml(v.name)}">${escapeHtml(v.name)}</span>
-          <button type="button" class="agy-tv-play-btn" data-url="${escapeHtml(v.url)}" title="Nghe thử" style="padding: 2px 6px; border-radius: 5px; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.14); color: #e4e4e7; font-size: 10.5px; cursor: pointer;">▶</button>
-          <button type="button" class="agy-tv-del-btn" data-url="${escapeHtml(v.url)}" title="Xóa voice" style="padding: 2px 6px; border-radius: 5px; background: rgba(239,68,68,0.12); border: 1px solid rgba(239,68,68,0.28); color: #fca5a5; font-size: 10.5px; cursor: pointer;">✕</button>
+          <button type="button" class="agy-tv-play-btn" data-url="${escapeHtml(v.url)}" title="Preview audio" style="padding: 2px 6px; border-radius: 5px; background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.14); color: #e4e4e7; font-size: 10.5px; cursor: pointer;">▶</button>
+          <button type="button" class="agy-tv-del-btn" data-url="${escapeHtml(v.url)}" title="Delete audio" style="padding: 2px 6px; border-radius: 5px; background: rgba(239,68,68,0.12); border: 1px solid rgba(239,68,68,0.28); color: #fca5a5; font-size: 10.5px; cursor: pointer;">✕</button>
         </div>
       `).join('');
 
@@ -5653,12 +5765,12 @@
       taskVoiceUpload.addEventListener('change', async (e) => {
         const files = Array.from((e.target && e.target.files) || []);
         if (files.length === 0) return;
-        if (uploadStatus) uploadStatus.textContent = `Đang nạp ${files.length} voice...`;
+        if (uploadStatus) uploadStatus.textContent = `Uploading ${files.length} audio file(s)...`;
         let nextVoices = getMediaLibrary('audio');
         for (const file of files) {
           const uploaded = await uploadMediaToServer(file, 'task_voice.mp3');
           let mediaUrl = uploaded && uploaded.url ? uploaded.url : '';
-          const displayName = (uploaded && uploaded.name) || file.name || 'Task Voice';
+          const displayName = (uploaded && uploaded.name) || file.name || 'Task Audio';
           if (!mediaUrl) {
             mediaUrl = await new Promise((resolve) => {
               const reader = new FileReader();
@@ -5674,7 +5786,7 @@
         taskVoiceUpload.value = '';
         applyTheme({ taskVoices: nextVoices, taskVoiceEnabled: true });
         if (taskVoiceToggle) taskVoiceToggle.checked = true;
-        if (uploadStatus) uploadStatus.textContent = `Đã thêm ${files.length} voice (${nextVoices.length} tổng)!`;
+        if (uploadStatus) uploadStatus.textContent = `Added ${files.length} audio file(s) (${nextVoices.length} total)!`;
         renderTaskVoiceList();
       });
     }
@@ -5683,7 +5795,7 @@
       customVgToggle.addEventListener('click', () => {
         const isHidden = customVgBox.style.display === 'none';
         customVgBox.style.display = isHidden ? 'grid' : 'none';
-        customVgToggle.textContent = isHidden ? 'Tùy chỉnh Voice & Câu chào ▴' : 'Tùy chỉnh Voice & Câu chào ▾';
+        customVgToggle.textContent = isHidden ? 'Audio & Greeting Studio ▴' : 'Audio & Greeting Studio ▾';
       });
     }
     if (greetingSaveBtn && greetingLinesEl) {
@@ -5694,7 +5806,7 @@
         window.__AGY_GREETING_NEED_FRESH__ = true;
         syncEmptyGreeting();
         if (greetingMsgEl) {
-          greetingMsgEl.textContent = lines.length > 0 ? `Đã lưu (${lines.length} câu)` : 'Đã xóa câu chào custom';
+          greetingMsgEl.textContent = lines.length > 0 ? `Saved (${lines.length} line${lines.length === 1 ? '' : 's'})` : 'Restored default greetings';
           setTimeout(() => { if (greetingMsgEl) greetingMsgEl.textContent = ''; }, 2000);
         }
       });
@@ -5706,7 +5818,7 @@
         window.__AGY_GREETING_NEED_FRESH__ = true;
         syncEmptyGreeting();
         if (greetingMsgEl) {
-          greetingMsgEl.textContent = 'Đã xóa danh sách câu chào';
+          greetingMsgEl.textContent = 'Cleared custom greeting list';
           setTimeout(() => { if (greetingMsgEl) greetingMsgEl.textContent = ''; }, 2000);
         }
       });
@@ -5742,7 +5854,7 @@
       }
       applyTheme(patch);
       if (uploadStatus) {
-        uploadStatus.textContent = isVideo ? 'Đã xóa video khỏi thư viện!' : (isAudio ? 'Đã xóa voice khỏi danh sách!' : 'Đã xóa ảnh khỏi thư viện!');
+        uploadStatus.textContent = isVideo ? 'Removed video from library!' : (isAudio ? 'Removed audio from list!' : 'Removed image from library!');
       }
       if (isAudio) {
         renderTaskVoiceList();
@@ -5766,7 +5878,7 @@
 
       const headerBadge = document.getElementById('agy-custom-theme-badge');
       if (headerBadge) {
-        headerBadge.textContent = `${totalCount} ${isVideoTab ? 'Video' : 'Ảnh'}`;
+        headerBadge.textContent = `${totalCount} ${isVideoTab ? 'Videos' : 'Images'}`;
       }
 
       const builtInHtml = builtInKeys.map((name) => {
@@ -5781,7 +5893,7 @@
           ? 'right: 10px; bottom: 8px; width: 76px; height: 24px; background-position: center;'
           : 'right: 12px; bottom: 4px; width: 42px; height: 38px; background-position: bottom center;';
         return `
-          <div class="agy-preset-card" data-name="${escapeHtml(name)}" style="border-radius: 12px; border: ${isSelected ? '1.5px solid #f4f4f5' : '1px solid rgba(255, 255, 255, 0.12)'}; background: rgba(14, 12, 12, 0.82); overflow: hidden; cursor: pointer; display: flex; flex-direction: column; transition: border-color 0.15s ease;">
+          <div class="agy-preset-card" data-name="${escapeHtml(name)}" style="border-radius: 12px; border: ${isSelected ? '1.5px solid #e9d5ff' : '1px solid rgba(255, 255, 255, 0.12)'}; background: ${isSelected ? 'rgba(46, 24, 78, 0.56)' : 'rgba(14, 12, 18, 0.82)'}; overflow: hidden; cursor: pointer; display: flex; flex-direction: column; transition: border-color 0.15s ease;">
             <div style="height: 68px; width: 100%; background-image: ${thumbBg}; background-size: cover; background-position: ${th.bgPosition || 'center'}; position: relative; display: flex; align-items: flex-end; padding: 8px 14px;">
               ${th.sticker ? `<div style="position: absolute; ${thumbOrnamentStyle} background-image: url('${th.sticker}'); background-size: contain; background-repeat: no-repeat; pointer-events: none;"></div>` : ''}
               <span style="font-size: 13.5px; font-weight: 600; color: #fff; text-shadow: 0 1px 4px rgba(0,0,0,0.7);">${escapeHtml(name)}</span>
@@ -5801,7 +5913,7 @@
           : isSameMediaUrl(curSt.customWp, item.url);
         const displayName = item.name || deriveMediaName(item.url, isVideoTab ? 'Saved Video' : 'Saved Image');
         const deleteBtnHtml = `
-          <button type="button" class="agy-saved-delete-btn" data-url="${escapeHtml(item.url)}" title="Xóa khỏi thư viện" style="position: absolute; top: 8px; right: 8px; z-index: 4; width: 24px; height: 24px; border-radius: 9999px; border: 1px solid rgba(255, 255, 255, 0.22); background: rgba(10, 12, 18, 0.72); color: #fca5a5; display: flex; align-items: center; justify-content: center; cursor: pointer; padding: 0; transition: background-color 0.15s ease, border-color 0.15s ease;">
+          <button type="button" class="agy-saved-delete-btn" data-url="${escapeHtml(item.url)}" title="Delete from library" style="position: absolute; top: 8px; right: 8px; z-index: 4; width: 24px; height: 24px; border-radius: 9999px; border: 1px solid rgba(255, 255, 255, 0.22); background: rgba(10, 12, 18, 0.72); color: #fca5a5; display: flex; align-items: center; justify-content: center; cursor: pointer; padding: 0; transition: background-color 0.15s ease, border-color 0.15s ease;">
             <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/></svg>
           </button>
         `;
@@ -5813,18 +5925,18 @@
           `
           : `
             <div style="position: absolute; inset: 0; background-image: linear-gradient(180deg, rgba(0,0,0,0.12), rgba(14,12,12,0.86)), url('${sanitizeCssUrl(resolvedUrl)}'); background-size: cover; background-position: center; pointer-events: none;"></div>
-            <span style="position: absolute; top: 8px; left: 10px; z-index: 3; font-size: 10px; font-weight: 600; letter-spacing: 0.4px; padding: 2px 6px; border-radius: 9999px; background: rgba(15, 23, 42, 0.75); border: 1px solid rgba(251, 191, 36, 0.35); color: #fde68a;">ẢNH</span>
+            <span style="position: absolute; top: 8px; left: 10px; z-index: 3; font-size: 10px; font-weight: 600; letter-spacing: 0.4px; padding: 2px 6px; border-radius: 9999px; background: rgba(24, 14, 42, 0.78); border: 1px solid rgba(192, 132, 252, 0.42); color: #e9d5ff;">IMAGE</span>
           `;
 
         return `
-          <div class="agy-saved-media-card" data-url="${escapeHtml(item.url)}" data-kind="${isVideoTab ? 'video' : 'image'}" style="border-radius: 12px; border: ${isSelected ? '1.5px solid #f4f4f5' : '1px solid rgba(255, 255, 255, 0.12)'}; background: rgba(14, 12, 12, 0.82); overflow: hidden; cursor: pointer; display: flex; flex-direction: column; transition: border-color 0.15s ease;">
+          <div class="agy-saved-media-card" data-url="${escapeHtml(item.url)}" data-kind="${isVideoTab ? 'video' : 'image'}" style="border-radius: 12px; border: ${isSelected ? '1.5px solid #e9d5ff' : '1px solid rgba(255, 255, 255, 0.12)'}; background: ${isSelected ? 'rgba(46, 24, 78, 0.56)' : 'rgba(14, 12, 18, 0.82)'}; overflow: hidden; cursor: pointer; display: flex; flex-direction: column; transition: border-color 0.15s ease;">
             <div style="height: 68px; width: 100%; position: relative; display: flex; align-items: flex-end; padding: 8px 14px; background: rgba(18, 20, 28, 0.9);">
               ${previewInner}
               ${deleteBtnHtml}
               <span style="position: relative; z-index: 3; font-size: 13px; font-weight: 600; color: #fff; text-shadow: 0 1px 4px rgba(0,0,0,0.85); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%;">${escapeHtml(displayName)}</span>
             </div>
             <div style="padding: 10px 14px; display: flex; justify-content: space-between; align-items: center;">
-              <span style="font-size: 12px; color: #a1a1aa;">${isVideoTab ? 'Video đã lưu' : 'Ảnh tĩnh đã lưu'}</span>
+              <span style="font-size: 12px; color: #a1a1aa;">${isVideoTab ? 'Saved Video' : 'Saved Image'}</span>
               <div class="agy-card-check-slot">${isSelected ? CHECK_SVG : ''}</div>
             </div>
           </div>
@@ -5832,8 +5944,8 @@
       }).join('');
 
       host.innerHTML = `
-        <div style="font-size: 15px; font-weight: 600; color: #ffffff; margin-bottom: 4px;">Theme Presets — ${isVideoTab ? 'Video động' : 'Ảnh tĩnh'} (${totalCount})</div>
-        <div style="font-size: 12.5px; color: #a1a1aa; margin-bottom: 14px;">${isVideoTab ? 'Live wallpaper mặc định & toàn bộ video nền bạn đã từng chọn.' : 'Preset tĩnh mặc định & toàn bộ ảnh nền bạn đã từng chọn.'}</div>
+        <div style="font-size: 15px; font-weight: 600; color: #ffffff; margin-bottom: 4px;">Theme Presets — ${isVideoTab ? 'Live Video' : 'Static Image'} (${totalCount})</div>
+        <div style="font-size: 12.5px; color: #a1a1aa; margin-bottom: 14px;">${isVideoTab ? 'Built-in live video presets and all custom MP4/WebM wallpapers in your library.' : 'Built-in static presets and all custom high-resolution wallpapers in your library.'}</div>
         <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px;">
           ${builtInHtml}
           ${savedHtml}
@@ -5843,6 +5955,8 @@
       host.querySelectorAll('.agy-preset-card').forEach((card) => {
         card.addEventListener('click', () => {
           const name = card.dataset.name;
+          const nextTh = THEMES[name] || mainTheme;
+          const nextSelBg = nextTh.cardSelectedBg || 'rgba(46, 24, 78, 0.72)';
           if (isVideoTab) {
             applyTheme({ themeName: name, bubbleName: name, customVideo: '', wpMode: 'video', wpEnabled: true });
           } else {
@@ -5853,8 +5967,8 @@
 
           container.querySelectorAll('.agy-bubble-card').forEach((b) => {
             const isSel = b.dataset.name === name;
-            b.style.border = isSel ? '1.5px solid #f4f4f5' : '1px solid rgba(255, 255, 255, 0.12)';
-            b.style.background = isSel ? 'rgba(42, 34, 30, 0.68)' : 'rgba(14, 12, 12, 0.78)';
+            b.style.border = isSel ? '1.5px solid #e9d5ff' : '1px solid rgba(255, 255, 255, 0.12)';
+            b.style.background = isSel ? nextSelBg : 'rgba(14, 12, 18, 0.78)';
             const slot = b.querySelector('.agy-card-check-slot');
             if (slot) slot.innerHTML = isSel ? CHECK_SVG : '';
           });
@@ -5941,12 +6055,14 @@
     container.querySelectorAll('.agy-bubble-card').forEach(card => {
       card.addEventListener('click', () => {
         const name = card.dataset.name;
+        const curTh = THEMES[getState().themeName] || mainTheme;
+        const selBg = curTh.cardSelectedBg || 'rgba(46, 24, 78, 0.72)';
         applyTheme({ bubbleName: name });
 
         container.querySelectorAll('.agy-bubble-card').forEach(b => {
           const isSel = b.dataset.name === name;
-          b.style.border = isSel ? '1.5px solid #f4f4f5' : '1px solid rgba(255, 255, 255, 0.12)';
-          b.style.background = isSel ? 'rgba(42, 34, 30, 0.68)' : 'rgba(14, 12, 12, 0.78)';
+          b.style.border = isSel ? '1.5px solid #e9d5ff' : '1px solid rgba(255, 255, 255, 0.12)';
+          b.style.background = isSel ? selBg : 'rgba(14, 12, 18, 0.78)';
           const slot = b.querySelector('.agy-card-check-slot');
           if (slot) slot.innerHTML = isSel ? CHECK_SVG : '';
         });
@@ -5958,12 +6074,14 @@
     container.querySelectorAll('.agy-input-card').forEach(card => {
       card.addEventListener('click', () => {
         const styleKey = card.dataset.style;
+        const curTh = THEMES[getState().themeName] || mainTheme;
+        const selBg = curTh.cardSelectedBg || 'rgba(46, 24, 78, 0.72)';
         applyTheme({ inputStyle: styleKey });
 
         container.querySelectorAll('.agy-input-card').forEach(c => {
           const isSel = c.dataset.style === styleKey;
-          c.style.border = isSel ? '1.5px solid #f4f4f5' : '1px solid rgba(255, 255, 255, 0.12)';
-          c.style.background = isSel ? 'rgba(42, 34, 30, 0.68)' : 'rgba(14, 12, 12, 0.78)';
+          c.style.border = isSel ? '1.5px solid #e9d5ff' : '1px solid rgba(255, 255, 255, 0.12)';
+          c.style.background = isSel ? selBg : 'rgba(14, 12, 18, 0.78)';
           const slot = c.querySelector('.agy-card-check-slot');
           if (slot) slot.innerHTML = isSel ? CHECK_SVG : '';
         });
@@ -6024,8 +6142,8 @@
     const btn = document.createElement('button');
     btn.id = 'agy-custom-theme-settings-btn';
     btn.type = 'button';
-    btn.className = 'select-none rounded px-3 py-1.5 text-sm font-medium transition-colors cursor-pointer text-white';
-    btn.style.cssText = 'background: linear-gradient(135deg, #e08e55 0%, #b45309 100%); border: 1px solid rgba(251, 191, 36, 0.4); box-shadow: 0 2px 10px rgba(224, 142, 85, 0.3); margin-top: 8px; margin-bottom: 8px; display: inline-flex; align-items: center; gap: 6px;';
+    btn.className = 'select-none rounded-lg px-3.5 py-1.5 text-sm font-semibold transition-colors cursor-pointer text-white';
+    btn.style.cssText = 'background: linear-gradient(135deg, #9333ea 0%, #6b21a8 100%); border: 1px solid rgba(233, 213, 255, 0.36); box-shadow: 0 4px 14px rgba(147, 51, 234, 0.35); margin-top: 8px; margin-bottom: 8px; display: inline-flex; align-items: center; gap: 6px;';
     btn.innerHTML = `
       <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/></svg>
       <span>Open Custom Theme Studio</span>

@@ -40,6 +40,16 @@ const UNLOCK_PROOF_TTL_MS = 60 * 1000;
 const adminTickets = new Map(); // ticketHex -> expiryEpochMs
 const unlockProofs = new Map(); // proofHex -> expiryEpochMs
 let serverFaceMatchStreak = 0;
+let appSessionUnlocked = false;
+let hadAttachedSession = false;
+
+function resetAppSessionLock() {
+    appSessionUnlocked = false;
+    hadAttachedSession = false;
+    serverFaceMatchStreak = 0;
+    adminTickets.clear();
+    unlockProofs.clear();
+}
 
 function scryptHashHex(secret, saltHex) {
     const saltBuf = Buffer.from(saltHex, 'hex');
@@ -738,9 +748,25 @@ function startMediaServer() {
             readJsonBody(req, res, 8 * 1024).then((body) => {
                 if (!body) return;
                 const valid = consumeUnlockProof(body.unlockProof);
+                if (valid) {
+                    appSessionUnlocked = true;
+                    for (const s of sessions.values()) {
+                        if (typeof s.syncNewDoc === 'function') s.syncNewDoc();
+                    }
+                }
                 res.writeHead(valid ? 200 : 401, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ ok: valid, unlocked: valid }));
             });
+            return;
+        }
+
+        if (req.method === 'POST' && pathname === '/auth/lock-now') {
+            resetAppSessionLock();
+            for (const s of sessions.values()) {
+                if (typeof s.reinject === 'function') s.reinject();
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, locked: true }));
             return;
         }
 
@@ -1119,11 +1145,12 @@ function buildInjectedSource() {
     missingPayloadLogged = false;
 
     const vault = readVault();
+    const sessionUnlocked = !vault.authLock || appSessionUnlocked;
     const cfgJson = JSON.stringify(readConfig());
     const mediaListJson = JSON.stringify(scanUserMedia());
     const mediaBase = mediaPort ? `http://127.0.0.1:${mediaPort}` : '';
     const payloadCode = fs.readFileSync(PAYLOAD_PATH, 'utf8');
-    return `window.__AGY_MEDIA_BASE_URL__ = ${JSON.stringify(mediaBase)};\nwindow.__AGY_API_TOKEN__ = ${JSON.stringify(DAEMON_API_TOKEN)};\nwindow.__AGY_AUTH_LOCK__ = ${Boolean(vault.authLock)};\nwindow.__AGY_HAS_CHORD__ = ${Boolean(vault.chordScrypt)};\nwindow.__AGY_INITIAL_CONFIG__ = ${cfgJson};\nwindow.__AGY_USER_MEDIA__ = ${mediaListJson};\n${payloadCode}`;
+    return `window.__AGY_MEDIA_BASE_URL__ = ${JSON.stringify(mediaBase)};\nwindow.__AGY_API_TOKEN__ = ${JSON.stringify(DAEMON_API_TOKEN)};\nwindow.__AGY_AUTH_LOCK__ = ${Boolean(vault.authLock)};\nwindow.__AGY_SESSION_UNLOCKED__ = ${Boolean(sessionUnlocked)};\nwindow.__AGY_HAS_CHORD__ = ${Boolean(vault.chordScrypt)};\nwindow.__AGY_INITIAL_CONFIG__ = ${cfgJson};\nwindow.__AGY_USER_MEDIA__ = ${mediaListJson};\n${payloadCode}`;
 }
 
 function getPortInfo() {
@@ -1168,8 +1195,9 @@ function createSession(target) {
     const ws = new globalThis.WebSocket(target.webSocketDebuggerUrl);
     let nextId = 1;
     const pending = new Map();
-    const session = { id: target.id, ws, target };
+    const session = { id: target.id, ws, target, docScriptId: null };
     sessions.set(target.id, session);
+    hadAttachedSession = true;
 
     function send(method, params = {}) {
         return new Promise((resolve, reject) => {
@@ -1183,10 +1211,23 @@ function createSession(target) {
         });
     }
 
+    session.syncNewDoc = async () => {
+        const src = buildInjectedSource();
+        if (!src) return;
+        try {
+            if (session.docScriptId) {
+                await send('Page.removeScriptToEvaluateOnNewDocument', { identifier: session.docScriptId });
+            }
+            const res = await send('Page.addScriptToEvaluateOnNewDocument', { source: src });
+            session.docScriptId = res && res.identifier ? res.identifier : null;
+        } catch (_) {}
+    };
+
     session.reinject = async () => {
         const src = buildInjectedSource();
         if (!src) return;
         try {
+            await session.syncNewDoc();
             await send('Runtime.evaluate', { expression: src, awaitPromise: false });
         } catch (_) {}
     };
@@ -1249,7 +1290,8 @@ function createSession(target) {
 
             const src = buildInjectedSource();
             if (src) {
-                await send('Page.addScriptToEvaluateOnNewDocument', { source: src });
+                const docRes = await send('Page.addScriptToEvaluateOnNewDocument', { source: src });
+                session.docScriptId = docRes && docRes.identifier ? docRes.identifier : null;
                 await send('Runtime.evaluate', { expression: src, awaitPromise: false });
             }
             log(`Attached target ${target.id} (${target.url})`);
@@ -1264,6 +1306,10 @@ function createSession(target) {
         }
         pending.clear();
         sessions.delete(target.id);
+        if (hadAttachedSession && sessions.size === 0) {
+            resetAppSessionLock();
+            log('All Antigravity windows closed; MFA session re-armed for next launch.');
+        }
     };
     ws.addEventListener('close', cleanup);
     ws.addEventListener('error', cleanup);

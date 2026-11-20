@@ -132,7 +132,11 @@ const INSPECT_EXPR = `(() => {
         liveBlurScrollerCount: liveBlurScrollers.length,
         hasLiveBlurRule,
         settingsTriggerPresent: Boolean(document.getElementById('agy-custom-theme-sidebar-btn')),
-        composerPresent: Boolean(document.querySelector('div.relative.flex.flex-col.rounded-lg.border')),
+        composerPresent: Boolean(document.querySelector('.surface-composer, .surface-composer-card')),
+        composerCardHeight: (() => {
+            const card = document.querySelector('.surface-composer-card');
+            return card ? Math.round(card.getBoundingClientRect().height) : null;
+        })(),
     };
 })()`;
 

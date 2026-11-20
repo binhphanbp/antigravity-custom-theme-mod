@@ -24,9 +24,13 @@ function resolvePortFile() {
     let candidates;
     if (process.platform === 'win32') {
         const appData = process.env.APPDATA || path.join(home, 'AppData', 'Roaming');
+        const localAppData = process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local');
         candidates = [
-            path.join(appData, 'antigravity', 'DevToolsActivePort'),
             path.join(appData, 'Antigravity', 'DevToolsActivePort'),
+            path.join(appData, 'antigravity', 'DevToolsActivePort'),
+            path.join(localAppData, 'Antigravity', 'DevToolsActivePort'),
+            path.join(localAppData, 'antigravity', 'DevToolsActivePort'),
+            path.join(localAppData, 'Antigravity', 'User Data', 'DevToolsActivePort'),
         ];
     } else if (process.platform === 'darwin') {
         const appSupport = path.join(home, 'Library', 'Application Support');
