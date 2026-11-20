@@ -26,8 +26,178 @@
   const STORAGE_BOOT_INTRO = 'agy_boot_intro_v3';
   const STORAGE_SKETCH_REVEAL = 'agy_sketch_reveal_v3';
   const STORAGE_TAWA_GREETING = 'agy_tawa_greeting_v3';
+
+  // Capture ephemeral CSPRNG daemon API token & server-authoritative vault policy into private closure
+  const PRIVATE_API_TOKEN = typeof window.__AGY_API_TOKEN__ === 'string' ? window.__AGY_API_TOKEN__ : '';
+  const HAS_VAULT_DAEMON = PRIVATE_API_TOKEN.length === 64;
+  let serverAuthLock = HAS_VAULT_DAEMON ? (window.__AGY_AUTH_LOCK__ !== false) : false;
+  let serverHasKeyChord = Boolean(window.__AGY_HAS_CHORD__);
+  try {
+    delete window.__AGY_API_TOKEN__;
+    delete window.__AGY_AUTH_LOCK__;
+    delete window.__AGY_HAS_CHORD__;
+    // Purge any legacy client-side credential artifacts from older versions
+    localStorage.removeItem('agy_auth_lock_v1');
+    localStorage.removeItem('agy_auth_pin_hash_v1');
+    localStorage.removeItem('agy_auth_pass_hash_v1');
+  } catch (e) {}
+
+  let sessionAuthenticated = !serverAuthLock;
+  let closureBootCompleted = false;
+  let isMountingBootOverlay = false;
+  let tamperGuardObserver = null;
+  let tamperRemountQueued = false;
+  let lastAdminTicket = '';
+  let lastAdminTicketExp = 0;
+
+  function rememberAdminTicket(ticket) {
+    if (typeof ticket === 'string' && ticket.length === 64) {
+      lastAdminTicket = ticket;
+      lastAdminTicketExp = Date.now() + 4.5 * 60 * 1000;
+    }
+  }
+
+  function getValidAdminTicket() {
+    return (lastAdminTicket && Date.now() < lastAdminTicketExp) ? lastAdminTicket : '';
+  }
+
+  function getDaemonBaseUrl() {
+    return (typeof window !== 'undefined' && window.__AGY_MEDIA_BASE_URL__)
+      ? String(window.__AGY_MEDIA_BASE_URL__).replace(/\/+$/, '')
+      : '';
+  }
+
+  function daemonFetch(relPath, options = {}) {
+    const base = getDaemonBaseUrl();
+    const headers = Object.assign(
+      {},
+      options.headers || {},
+      PRIVATE_API_TOKEN ? { 'X-Agy-Token': PRIVATE_API_TOKEN } : {}
+    );
+    return fetch(`${base}${relPath}`, Object.assign({}, options, { headers }));
+  }
+
+  function serializeKeyCombo(e) {
+    if (!e || ['Control', 'Shift', 'Alt', 'Meta'].includes(e.key)) return '';
+    const mods = [];
+    if (e.ctrlKey) mods.push('Ctrl');
+    if (e.altKey) mods.push('Alt');
+    if (e.shiftKey) mods.push('Shift');
+    if (e.metaKey) mods.push('Meta');
+    const code = String(e.code || e.key || '').trim();
+    if (!code) return '';
+    return [...mods, code].join('+');
+  }
+
+  function ensureVaultLockStyle() {
+    if (document.getElementById('agy-vault-lock-guard')) return;
+    const host = document.head || document.documentElement;
+    if (!host) return;
+    const st = document.createElement('style');
+    st.id = 'agy-vault-lock-guard';
+    st.textContent = `
+      body[data-agy-mfa-locked="1"] .agy-shell,
+      body[data-agy-mfa-locked="1"] .settings-modal-container,
+      body[data-agy-mfa-locked="1"] #agy-custom-theme-modal-backdrop {
+        visibility: hidden !important;
+        pointer-events: none !important;
+        user-select: none !important;
+      }
+    `;
+    host.appendChild(st);
+  }
+
+  function enforceWorkspaceLock() {
+    if (sessionAuthenticated) return;
+    ensureVaultLockStyle();
+    if (document.body && document.body.getAttribute('data-agy-mfa-locked') !== '1') {
+      document.body.setAttribute('data-agy-mfa-locked', '1');
+    }
+    document.querySelectorAll('.agy-shell').forEach((sh) => {
+      if (!sh.inert) sh.inert = true;
+      if (sh.getAttribute('aria-hidden') !== 'true') sh.setAttribute('aria-hidden', 'true');
+    });
+    if (!tamperGuardObserver && typeof MutationObserver !== 'undefined') {
+      tamperGuardObserver = new MutationObserver(() => {
+        if (sessionAuthenticated || isMountingBootOverlay) return;
+        ensureVaultLockStyle();
+        if (document.body && document.body.getAttribute('data-agy-mfa-locked') !== '1') {
+          document.body.setAttribute('data-agy-mfa-locked', '1');
+        }
+        document.querySelectorAll('.agy-shell').forEach((sh) => {
+          if (!sh.inert) sh.inert = true;
+          if (sh.getAttribute('aria-hidden') !== 'true') sh.setAttribute('aria-hidden', 'true');
+        });
+        const ov = document.getElementById('agy-boot-overlay');
+        const bs = document.getElementById('agy-boot-styles');
+        const tampered = !ov || !ov.isConnected || !bs || !bs.isConnected ||
+          ov.classList.contains('done') || ov.style.display === 'none' ||
+          ov.style.visibility === 'hidden' || ov.style.opacity === '0';
+        if (tampered && !tamperRemountQueued) {
+          tamperRemountQueued = true;
+          queueMicrotask(() => {
+            tamperRemountQueued = false;
+            if (!sessionAuthenticated) {
+              mountBootSequence(true, true);
+            }
+          });
+        }
+      });
+      const root = document.documentElement || document.body;
+      if (root) {
+        tamperGuardObserver.observe(root, {
+          childList: true,
+          subtree: true,
+          attributes: true,
+          attributeFilter: ['style', 'class', 'inert', 'data-agy-mfa-locked', 'aria-hidden']
+        });
+      }
+    }
+  }
+
+  function releaseWorkspaceLock() {
+    if (!sessionAuthenticated) return;
+    if (tamperGuardObserver) {
+      try { tamperGuardObserver.disconnect(); } catch (e) {}
+      tamperGuardObserver = null;
+    }
+    const guardStyle = document.getElementById('agy-vault-lock-guard');
+    if (guardStyle) guardStyle.remove();
+    if (document.body) {
+      document.body.removeAttribute('data-agy-mfa-locked');
+    }
+    document.querySelectorAll('.agy-shell').forEach((sh) => {
+      sh.inert = false;
+      sh.removeAttribute('aria-hidden');
+    });
+  }
+
+  function stopAuthCamera() {
+    if (window.__AGY_FACE_POLL_TIMER__) {
+      clearTimeout(window.__AGY_FACE_POLL_TIMER__);
+      window.__AGY_FACE_POLL_TIMER__ = null;
+    }
+    if (window.__AGY_FACE_FALLBACK_TIMER__) {
+      clearTimeout(window.__AGY_FACE_FALLBACK_TIMER__);
+      window.__AGY_FACE_FALLBACK_TIMER__ = null;
+    }
+    if (window.__AGY_LOCKOUT_TIMER__) {
+      clearInterval(window.__AGY_LOCKOUT_TIMER__);
+      window.__AGY_LOCKOUT_TIMER__ = null;
+    }
+    if (window.__AGY_AUTH_STREAM__) {
+      try {
+        window.__AGY_AUTH_STREAM__.getTracks().forEach((tr) => tr.stop());
+      } catch (e) {}
+      window.__AGY_AUTH_STREAM__ = null;
+    }
+  }
   const GREETING_RX = /^(?:Hey\s+[^,]{1,40},\s+what\s+should\s+we\s+build\s+today\??|Good\s+to\s+see\s+you,\s+[^.]{1,40}\.\s+What'?s\s+next\??|What\s+(?:should|are)\s+we\s+build(?:ing)?\s+today\??|Welcome\s+back[,.!\s]+[^.!?]{0,40}(?:[.!?]\s*(?:Where\s+should\s+we\s+pick\s+up|What'?s\s+next|What\s+should\s+we\s+build)[^.!?]{0,40}[.!?]?)?|Where\s+should\s+we\s+pick\s+up\??|Ready\s+(?:to\s+build|when\s+you\s+are)[,.!\s]*.*)$/i;
-  const DEFAULT_CUSTOM_GREETINGS = [];
+  const DEFAULT_CUSTOM_GREETINGS = [
+    'Welcome back, Binh Phan.',
+    'What shall we architect today, Binh Phan?',
+    'Workspace online. Ready when you are, Binh Phan.'
+  ];
 
   const CHECK_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`;
 
@@ -37,8 +207,8 @@
       desc: 'Follows the active theme borders & decorative SVG ornament'
     },
     'double_gold': {
-      label: 'Amber Gold Double Border',
-      desc: 'Warm metallic double border with corner filigree'
+      label: 'Metallic Amethyst Double Border',
+      desc: 'Iridescent chrome-violet double border with corner filigree'
     },
     'glass': {
       label: 'Translucent Crystal Glass',
@@ -49,6 +219,15 @@
       desc: 'Sleek subtle border without top decorative stickers'
     }
   };
+
+  try {
+    if (localStorage.getItem('agy_binhphan_mfa_v8') !== '1') {
+      localStorage.setItem('agy_binhphan_mfa_v8', '1');
+      window.__AGY_BOOT_PLAYED__ = false;
+      window.__AGY_REVEAL_DONE_ONCE__ = false;
+      window.__AGY_GREETING_NEED_FRESH__ = true;
+    }
+  } catch (e) {}
 
   function escapeHtml(str) {
     return String(str || '')
@@ -317,12 +496,14 @@
     const tawaGreeting = localStorage.getItem(STORAGE_TAWA_GREETING) !== null
       ? localStorage.getItem(STORAGE_TAWA_GREETING) !== 'false'
       : (init.tawaGreeting !== undefined ? init.tawaGreeting : true);
+    const authLock = Boolean(serverAuthLock);
     return {
       themeName, bubbleName, inputStyle, dimming, wpEnabled, wpMode,
       customWp, customVideo, savedImages, savedVideos,
       taskVoices, taskVoiceEnabled, taskVoiceVol, customGreetings,
       userAvatar, agentAvatar, glassBlur, avatarSize, avatarRadius,
-      bootIntro, sketchReveal, tawaGreeting
+      bootIntro, sketchReveal, tawaGreeting,
+      authLock
     };
   }
 
@@ -1018,8 +1199,8 @@
     function strokeOnePath(targetCtx, pts, wFactor, isFresh) {
       if (!pts || pts.length < 4) return;
       const vertCount = pts.length >> 1;
-      const alpha = isFresh ? 0.96 : (0.48 + 0.40 * wFactor);
-      targetCtx.strokeStyle = isFresh ? `rgba(255, 255, 255, ${alpha})` : `rgba(232, 239, 252, ${alpha.toFixed(2)})`;
+      const alpha = isFresh ? 0.98 : (0.52 + 0.40 * wFactor);
+      targetCtx.strokeStyle = isFresh ? `rgba(243, 232, 255, ${alpha})` : `rgba(216, 180, 254, ${alpha.toFixed(2)})`;
       targetCtx.lineWidth = (0.64 + 0.78 * wFactor) * dpr;
       targetCtx.beginPath();
       targetCtx.moveTo(pts[0] * cw, pts[1] * ch);
@@ -1388,9 +1569,11 @@
     } catch (e) {}
   }
 
-  function teardownBootOverlay() {
+  function teardownBootOverlay(internalRemount = false) {
+    if (!sessionAuthenticated && !internalRemount) return;
     clearBootTimers();
     stopBootAudio();
+    stopAuthCamera();
     const ov = document.getElementById('agy-boot-overlay');
     if (ov) ov.remove();
     const fl = document.getElementById('agy-flash-curtain');
@@ -1399,21 +1582,37 @@
     if (st) st.remove();
   }
 
-  function mountBootSequence(forceReplay = false) {
+  function mountBootSequence(forceReplay = false, jumpToMfa = false) {
     const st = getState();
-    if (!forceReplay && (!st.bootIntro || window.__AGY_BOOT_PLAYED__)) {
-      return;
+    const mfaRequired = Boolean(serverAuthLock) && (!sessionAuthenticated || forceReplay);
+    if (!forceReplay) {
+      if (!HAS_VAULT_DAEMON) {
+        if (!st.bootIntro || window.__AGY_BOOT_PLAYED__) return;
+      } else if (sessionAuthenticated && (!st.bootIntro || closureBootCompleted)) {
+        return;
+      }
     }
     window.__AGY_BOOT_PLAYED__ = true;
-    teardownBootOverlay();
+    closureBootCompleted = true;
 
-    const starfieldUrl = sanitizeCssUrl(BOOT_ASSETS.starfieldBg || resolveMediaUrl('assets/starfield-boot-bg.jpg'));
+    if (mfaRequired && HAS_VAULT_DAEMON) {
+      sessionAuthenticated = false;
+      enforceWorkspaceLock();
+    }
+
+    ensureGreetingFonts();
+    isMountingBootOverlay = true;
+    teardownBootOverlay(true);
+
+    const activeTh = THEMES[st.themeName] || THEMES[DEFAULT_THEME_KEY] || {};
+    const bgArtUrl = sanitizeCssUrl(resolveMediaUrl(st.customWp || activeTh.wallpaper || '') || BOOT_ASSETS.starfieldBg || resolveMediaUrl('assets/starfield-boot-bg.jpg'));
     const iconColorUrl = BOOT_ASSETS.agyColorIcon || resolveMediaUrl('assets/agy-icon-color.png');
+    const avatarUrl = sanitizeCssUrl(st.userAvatar && st.userAvatar !== 'none' ? st.userAvatar : (activeTh.userAvatar || iconColorUrl));
     const voiceUrls = {
-      1: BOOT_ASSETS.voice1 || resolveMediaUrl('assets/voice/tawa_voice1.mp3'),
-      2: BOOT_ASSETS.voice2 || resolveMediaUrl('assets/voice/tawa_voice2.mp3'),
-      3: BOOT_ASSETS.voice3 || resolveMediaUrl('assets/voice/tawa_voice3.mp3'),
-      4: BOOT_ASSETS.voice4 || resolveMediaUrl('assets/voice/tawa_voice4.mp3')
+      1: BOOT_ASSETS.voice1 || resolveMediaUrl('assets/voice/cyber_voice1.mp3'),
+      2: BOOT_ASSETS.voice2 || resolveMediaUrl('assets/voice/cyber_voice2.mp3'),
+      3: BOOT_ASSETS.voice3 || resolveMediaUrl('assets/voice/cyber_voice3.mp3'),
+      4: BOOT_ASSETS.voice4 || resolveMediaUrl('assets/voice/cyber_voice4.mp3')
     };
 
     const bootStyle = document.createElement('style');
@@ -1423,62 +1622,55 @@
         position: fixed;
         inset: 0;
         z-index: 2147483000;
-        background: #000000;
+        background: #06050b;
         display: flex;
         flex-direction: column;
         justify-content: space-between;
-        padding: 22px 30px;
-        font-family: ui-monospace, 'JetBrains Mono', 'Cascadia Mono', Consolas, monospace;
-        color: #f4f4f5;
+        padding: 44px 48px 34px;
+        font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI Variable Display', 'Segoe UI', sans-serif;
+        color: #fafafa;
         overflow: hidden;
-        transition: background-color 0.6s ease, opacity 0.65s ease;
+        transition: opacity 0.62s cubic-bezier(0.22, 1, 0.36, 1);
         user-select: none;
+        -webkit-font-smoothing: antialiased;
       }
-      #agy-boot-overlay.hud-mode { background: #050507; }
       #agy-boot-overlay.done { opacity: 0; pointer-events: none; }
       #agy-boot-overlay.done.instant { display: none; transition: none; }
 
-      #agy-boot-overlay .agy-boot-starfield {
-        position: absolute;
-        inset: -8px;
-        z-index: 0;
-        background: url("${starfieldUrl}") center center / cover no-repeat;
-        filter: blur(1.2px) brightness(0.62) contrast(1.08);
-        opacity: 0;
-        transition: opacity 0.85s ease;
-        pointer-events: none;
-      }
-      #agy-boot-overlay.hud-mode .agy-boot-starfield { opacity: 0.55; }
-      #agy-boot-overlay .agy-boot-vignette {
+      #agy-boot-overlay .agy-boot-art {
         position: absolute;
         inset: 0;
         z-index: 0;
-        background: radial-gradient(circle at 50% 48%, rgba(4,4,6,0.25) 20%, rgba(4,4,6,0.74) 100%);
+        background: url("${bgArtUrl}") center center / cover no-repeat;
         opacity: 0;
-        transition: opacity 0.85s ease;
+        transform: scale(1.045);
+        transition: opacity 1.1s ease, transform 6.5s cubic-bezier(0.16, 1, 0.3, 1);
         pointer-events: none;
       }
-      #agy-boot-overlay.hud-mode .agy-boot-vignette { opacity: 1; }
-      #agy-boot-overlay .agy-splash-sheen {
+      #agy-boot-overlay.hud-mode .agy-boot-art {
+        opacity: 0.34;
+        transform: scale(1);
+      }
+      #agy-boot-overlay .agy-boot-vignette {
         position: absolute;
-        inset: -30%;
-        z-index: 3;
+        inset: 0;
+        z-index: 1;
+        background:
+          radial-gradient(circle at 50% 44%, rgba(139, 92, 246, 0.14) 0%, rgba(10, 8, 18, 0.72) 56%, rgba(5, 4, 10, 0.95) 100%),
+          linear-gradient(180deg, rgba(6, 5, 11, 0.55) 0%, rgba(6, 5, 11, 0.25) 50%, rgba(6, 5, 11, 0.82) 100%);
         pointer-events: none;
-        transform: translateX(-85%);
-        background: linear-gradient(112deg, transparent 38%, rgba(255,255,255,0.06) 48%, rgba(255,255,255,0.14) 50%, rgba(255,255,255,0.05) 52%, transparent 62%);
       }
-      #agy-boot-overlay .agy-splash-sheen.run { animation: agyDiagSheen 1.25s cubic-bezier(0.25,0.1,0.25,1) forwards; }
-      @keyframes agyDiagSheen { from { transform: translateX(-85%); } to { transform: translateX(85%); } }
-
-      #agy-boot-overlay .agy-hud-scanline {
-        position: absolute; left: 0; right: 0; height: 46px; z-index: 4; pointer-events: none; opacity: 0;
-        background: linear-gradient(180deg, transparent, rgba(255,255,255,0.08), transparent);
-      }
-      #agy-boot-overlay .agy-hud-scanline.sweep { animation: agyHudScan 0.85s ease-out forwards; }
-      @keyframes agyHudScan {
-        0% { top: 8%; opacity: 0; }
-        25% { opacity: 1; }
-        100% { top: 92%; opacity: 0; }
+      #agy-boot-overlay .agy-boot-grid {
+        position: absolute;
+        inset: 0;
+        z-index: 1;
+        background-image:
+          linear-gradient(to right, rgba(255, 255, 255, 0.028) 1px, transparent 1px),
+          linear-gradient(to bottom, rgba(255, 255, 255, 0.028) 1px, transparent 1px);
+        background-size: 64px 64px;
+        mask-image: radial-gradient(circle at 50% 48%, rgba(0,0,0,0.85) 0%, transparent 72%);
+        -webkit-mask-image: radial-gradient(circle at 50% 48%, rgba(0,0,0,0.85) 0%, transparent 72%);
+        pointer-events: none;
       }
 
       #agy-flash-curtain {
@@ -1487,145 +1679,758 @@
         z-index: 2147483001;
         pointer-events: none;
         opacity: 0;
-        background: radial-gradient(circle at 82% 85%, rgba(255,255,255,0.96) 0%, rgba(212,212,216,0.78) 48%, rgba(161,161,170,0.55) 100%);
+        background: radial-gradient(circle at 50% 50%, rgba(243, 232, 255, 0.72) 0%, rgba(168, 85, 247, 0.28) 52%, transparent 100%);
       }
-      #agy-flash-curtain.burst { animation: agyFlashBurst 1.15s cubic-bezier(0.22,1,0.36,1) forwards; }
-      @keyframes agyFlashBurst { 0% { opacity: 0; } 28% { opacity: 0.92; } 100% { opacity: 0; } }
+      #agy-flash-curtain.burst { animation: agyFlashBurst 0.95s cubic-bezier(0.22, 1, 0.36, 1) forwards; }
+      @keyframes agyFlashBurst { 0% { opacity: 0; } 24% { opacity: 0.85; } 100% { opacity: 0; } }
 
       #agy-boot-overlay .agy-boot-header,
       #agy-boot-overlay .agy-boot-footer {
-        position: relative; z-index: 5; display: flex; justify-content: space-between;
-        font-size: 10.5px; letter-spacing: 0.14em; color: #71717a; opacity: 0; transition: opacity 0.45s ease;
+        position: relative;
+        z-index: 5;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        opacity: 0;
+        transition: opacity 0.45s ease;
       }
-      #agy-boot-overlay .agy-boot-header { align-items: flex-start; }
-      #agy-boot-overlay .agy-boot-footer { align-items: center; padding-bottom: 18px; }
       #agy-boot-overlay.hud-mode .agy-boot-header,
       #agy-boot-overlay.hud-mode .agy-boot-footer { opacity: 1; }
 
-      #agy-boot-overlay .agy-boot-brand { display: flex; flex-direction: column; gap: 3px; }
-      #agy-boot-overlay .agy-boot-brand strong {
-        font-size: 14px; color: #ffffff; letter-spacing: 0.16em;
-        font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; font-weight: 700;
+      #agy-boot-overlay .agy-brand-row {
+        display: flex;
+        align-items: center;
+        gap: 12px;
       }
-      #agy-boot-overlay .agy-boot-brand .sub-line { font-size: 9px; color: #71717a; letter-spacing: 0.22em; }
-      #agy-boot-overlay .agy-boot-rev { margin-top: 10px; font-size: 9.5px; color: #52525b; display: flex; align-items: center; gap: 8px; }
-      #agy-boot-overlay .agy-boot-rev .blue-rev { color: #60a5fa; }
+      #agy-boot-overlay .agy-brand-row img {
+        width: 26px;
+        height: 26px;
+        object-fit: contain;
+      }
+      #agy-boot-overlay .agy-brand-name {
+        font-size: 16.5px;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+        color: #ffffff;
+      }
+      #agy-boot-overlay .agy-brand-tag {
+        font-size: 12.5px;
+        font-weight: 600;
+        color: #d8b4fe;
+        background: rgba(168, 85, 247, 0.14);
+        border: 1px solid rgba(192, 132, 252, 0.26);
+        padding: 3px 10px;
+        border-radius: 999px;
+      }
 
       #agy-boot-overlay .agy-boot-skip {
-        cursor: pointer; background: transparent; border: none; color: #71717a;
-        padding: 4px 8px; font-family: inherit; font-size: 10.5px; letter-spacing: 0.16em; transition: color 0.15s ease;
+        cursor: pointer;
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid rgba(255, 255, 255, 0.10);
+        color: #d4d4d8;
+        padding: 7px 15px;
+        border-radius: 999px;
+        font-family: inherit;
+        font-size: 13.5px;
+        font-weight: 500;
+        transition: background 0.18s ease, color 0.18s ease, border-color 0.18s ease;
       }
-      #agy-boot-overlay .agy-boot-skip:hover { color: #ffffff; }
+      #agy-boot-overlay .agy-boot-skip:hover {
+        background: rgba(255, 255, 255, 0.11);
+        border-color: rgba(255, 255, 255, 0.24);
+        color: #ffffff;
+      }
 
       #agy-boot-overlay .agy-boot-stage-wrap {
-        position: relative; z-index: 5; flex: 1; display: flex; align-items: center; justify-content: center;
+        position: relative;
+        z-index: 5;
+        flex: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
       }
       #agy-boot-overlay .agy-boot-stage {
-        display: none; flex-direction: column; align-items: center; text-align: center; max-width: 560px; width: 100%;
+        display: none;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        width: 100%;
+        animation: agyStageEnter 0.42s cubic-bezier(0.16, 1, 0.3, 1) forwards;
       }
       #agy-boot-overlay .agy-boot-stage.active { display: flex; }
-
-      #agy-boot-overlay .agy-stagger-char {
-        display: inline-block; opacity: 0; transform: translateY(2px); filter: blur(1.5px);
-        animation: agyCharFadeIn 0.24s cubic-bezier(0.22,1,0.36,1) forwards;
+      @keyframes agyStageEnter {
+        from { opacity: 0; transform: translateY(12px) scale(0.985); }
+        to { opacity: 1; transform: translateY(0) scale(1); }
       }
-      #agy-boot-overlay .agy-stagger-space { display: inline-block; width: 0.32em; }
-      @keyframes agyCharFadeIn { to { opacity: 1; transform: translateY(0); filter: blur(0); } }
-      #agy-boot-overlay .wipe-out { opacity: 0; transition: opacity 0.28s ease; }
-      #agy-boot-overlay .stage-fade-out { opacity: 0 !important; transform: scale(1.06); transition: opacity 0.58s ease, transform 0.58s cubic-bezier(0.22,1,0.36,1); }
-      #agy-boot-overlay .agy-welcome-reveal { opacity: 0; transform: translateY(6px); animation: agyWelcomeIn 0.48s cubic-bezier(0.22,1,0.36,1) forwards; }
-      @keyframes agyWelcomeIn { to { opacity: 1; transform: translateY(0); } }
+      #agy-boot-overlay .wipe-out {
+        opacity: 0 !important;
+        transform: translateY(-8px) scale(0.99) !important;
+        transition: opacity 0.22s ease, transform 0.22s ease !important;
+      }
 
+      /* Stage 0: Crisp Editorial Brand Opening */
       #agy-boot-overlay .agy-splash-logo {
-        width: 68px; height: 68px; object-fit: contain; margin-bottom: 16px; opacity: 0;
-        filter: drop-shadow(0 0 22px rgba(255,255,255,0.18)); animation: agySplashFade 2.5s ease forwards;
+        width: 78px;
+        height: 78px;
+        object-fit: contain;
+        margin-bottom: 20px;
+        filter: drop-shadow(0 8px 28px rgba(168, 85, 247, 0.35));
+        animation: agySplashFade 1.8s cubic-bezier(0.16, 1, 0.3, 1) forwards;
       }
       #agy-boot-overlay .agy-splash-wordmark {
-        font-family: 'Segoe UI', system-ui, sans-serif; font-size: 15px; font-weight: 700; letter-spacing: 0.42em;
-        color: #ffffff; margin-bottom: 5px; opacity: 0; animation: agySplashFade 2.5s ease 0.15s forwards;
+        font-size: 34px;
+        font-weight: 700;
+        letter-spacing: -0.03em;
+        color: #ffffff;
+        margin-bottom: 8px;
+        animation: agySplashFade 1.8s cubic-bezier(0.16, 1, 0.3, 1) 0.06s both;
       }
       #agy-boot-overlay .agy-splash-caption {
-        font-size: 9px; letter-spacing: 0.36em; color: #71717a; opacity: 0; animation: agySplashFade 2.5s ease 0.25s forwards;
+        font-size: 15.5px;
+        font-weight: 500;
+        color: #a1a1aa;
+        letter-spacing: -0.005em;
+        animation: agySplashFade 1.8s cubic-bezier(0.16, 1, 0.3, 1) 0.12s both;
       }
       @keyframes agySplashFade {
-        0% { opacity: 0; transform: scale(0.95); }
-        20% { opacity: 1; transform: scale(1); }
-        76% { opacity: 1; }
-        100% { opacity: 0; }
+        0% { opacity: 0; transform: translateY(8px) scale(0.97); }
+        24% { opacity: 1; transform: translateY(0) scale(1); }
+        80% { opacity: 1; transform: translateY(0) scale(1); }
+        100% { opacity: 0; transform: translateY(-4px) scale(1.01); }
       }
 
-      #agy-boot-overlay .agy-hud-title {
-        font-family: 'Segoe UI', system-ui, sans-serif; font-size: 26px; font-weight: 400; letter-spacing: 0.22em; color: #f4f4f5;
+      /* Architectural Glass Dialog Card (Stage 1 & Stage 2) */
+      #agy-boot-overlay .agy-dialog-card {
+        width: min(540px, 92vw);
+        background: linear-gradient(165deg, rgba(22, 17, 35, 0.88) 0%, rgba(11, 9, 19, 0.94) 100%);
+        border: 1px solid rgba(255, 255, 255, 0.09);
+        box-shadow:
+          inset 0 1px 0 rgba(243, 232, 255, 0.22),
+          0 32px 80px rgba(0, 0, 0, 0.72),
+          0 0 48px rgba(147, 51, 234, 0.12);
+        border-radius: 22px;
+        padding: 38px 42px;
+        text-align: left;
+        box-sizing: border-box;
       }
-      #agy-boot-overlay .agy-hud-subtitle { font-size: 10.5px; letter-spacing: 0.38em; color: #8c8c94; margin-bottom: 30px; }
-      #agy-boot-overlay .agy-hud-btn {
-        position: relative; overflow: hidden; cursor: pointer; background: rgba(255,255,255,0.03);
-        border: 1px solid rgba(255,255,255,0.34); color: #e4e4e7; padding: 9px 26px;
-        font-family: inherit; font-size: 11px; letter-spacing: 0.2em; transition: border-color 0.2s ease, color 0.2s ease;
+      #agy-boot-overlay .agy-status-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 13.5px;
+        font-weight: 600;
+        color: #e9d5ff;
+        margin-bottom: 14px;
       }
-      #agy-boot-overlay .agy-hud-btn::before {
-        content: ''; position: absolute; inset: 0; background: #ffffff; transform: scaleX(0); transform-origin: left center;
-        transition: transform 0.28s cubic-bezier(0.22,1,0.36,1); z-index: 0;
+      #agy-boot-overlay .agy-status-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #c084fc;
+        box-shadow: 0 0 10px rgba(192, 132, 252, 0.9);
       }
-      #agy-boot-overlay .agy-hud-btn span { position: relative; z-index: 1; }
-      #agy-boot-overlay .agy-hud-btn:hover::before,
-      #agy-boot-overlay .agy-hud-btn.triggered::before { transform: scaleX(1); }
-      #agy-boot-overlay .agy-hud-btn:hover,
-      #agy-boot-overlay .agy-hud-btn.triggered { color: #000000; border-color: #ffffff; }
-      #agy-boot-overlay .agy-hud-hint { margin-top: 12px; font-size: 9.5px; color: #52525b; letter-spacing: 0.14em; }
+      #agy-boot-overlay .agy-card-heading {
+        font-size: 30px;
+        font-weight: 700;
+        letter-spacing: -0.025em;
+        line-height: 1.24;
+        color: #ffffff;
+        margin: 0 0 10px;
+      }
+      #agy-boot-overlay .agy-card-desc {
+        font-size: 16px;
+        font-weight: 400;
+        line-height: 1.6;
+        color: #a1a1aa;
+        margin: 0 0 28px;
+      }
 
-      #agy-boot-overlay .agy-id-table { width: 290px; padding: 12px 0; margin-bottom: 22px; display: flex; flex-direction: column; gap: 7px; font-size: 10.5px; }
-      #agy-boot-overlay .agy-id-row { display: flex; justify-content: space-between; align-items: center; }
-      #agy-boot-overlay .agy-id-row span:first-child { color: #52525b; letter-spacing: 0.14em; }
-      #agy-boot-overlay .agy-id-row span:last-child { color: #f4f4f5; font-weight: 600; letter-spacing: 0.16em; }
+      /* Profile Identity Header & Spec Surface */
+      #agy-boot-overlay .agy-profile-head {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        margin-bottom: 24px;
+      }
+      #agy-boot-overlay .agy-profile-avatar {
+        width: 54px;
+        height: 54px;
+        border-radius: 50%;
+        background: url("${avatarUrl}") center center / cover no-repeat;
+        border: 1.5px solid rgba(216, 180, 254, 0.55);
+        box-shadow: 0 4px 16px rgba(147, 51, 234, 0.28);
+        flex-shrink: 0;
+      }
+      #agy-boot-overlay .agy-profile-eyebrow {
+        font-size: 13.5px;
+        font-weight: 600;
+        color: #c084fc;
+        margin-bottom: 3px;
+      }
+      #agy-boot-overlay .agy-spec-box {
+        background: rgba(255, 255, 255, 0.035);
+        border: 1px solid rgba(255, 255, 255, 0.085);
+        border-radius: 16px;
+        overflow: hidden;
+        margin-bottom: 28px;
+      }
+      #agy-boot-overlay .agy-spec-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 16px;
+        padding: 17px 22px;
+      }
+      #agy-boot-overlay .agy-spec-row + .agy-spec-row {
+        border-top: 1px solid rgba(255, 255, 255, 0.065);
+      }
+      #agy-boot-overlay .agy-spec-label {
+        font-size: 15.5px;
+        font-weight: 500;
+        color: #a1a1aa;
+        white-space: nowrap;
+      }
+      #agy-boot-overlay .agy-spec-value-name {
+        font-size: 19.5px;
+        font-weight: 700;
+        letter-spacing: -0.015em;
+        color: #ffffff;
+        text-align: right;
+      }
+      #agy-boot-overlay .agy-spec-value-code {
+        font-family: 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
+        font-size: 13.5px;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        color: #f3e8ff;
+        background: rgba(168, 85, 247, 0.16);
+        border: 1px solid rgba(192, 132, 252, 0.32);
+        padding: 6px 12px;
+        border-radius: 9px;
+        text-align: right;
+      }
 
-      #agy-boot-overlay .agy-icon-morph-box { position: relative; width: 112px; height: 112px; margin: 8px 0 14px; display: flex; align-items: center; justify-content: center; }
-      #agy-boot-overlay .agy-icon-outline-svg { position: absolute; inset: 0; width: 100%; height: 100%; transition: opacity 0.45s ease; }
+      /* Tactile Metallic Amethyst Primary CTA */
+      #agy-boot-overlay .agy-primary-btn {
+        width: 100%;
+        height: 52px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0 20px 0 22px;
+        border-radius: 14px;
+        cursor: pointer;
+        border: 1px solid rgba(233, 213, 255, 0.34);
+        background: linear-gradient(135deg, #9333ea 0%, #7e22ce 55%, #6b21a8 100%);
+        box-shadow:
+          inset 0 1px 0 rgba(255, 255, 255, 0.28),
+          0 10px 24px rgba(126, 34, 206, 0.38);
+        color: #ffffff;
+        font-family: inherit;
+        font-size: 16px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+        transition: transform 0.16s ease, box-shadow 0.16s ease, filter 0.16s ease;
+      }
+      #agy-boot-overlay .agy-primary-btn:hover {
+        filter: brightness(1.08);
+        transform: translateY(-1px);
+        box-shadow:
+          inset 0 1px 0 rgba(255, 255, 255, 0.36),
+          0 14px 30px rgba(147, 51, 234, 0.5);
+      }
+      #agy-boot-overlay .agy-primary-btn:active,
+      #agy-boot-overlay .agy-primary-btn.triggered {
+        transform: translateY(0) scale(0.992);
+        filter: brightness(1.14);
+      }
+      #agy-boot-overlay .agy-keycap {
+        font-family: 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
+        font-size: 12.5px;
+        font-weight: 600;
+        color: #f3e8ff;
+        background: rgba(255, 255, 255, 0.16);
+        border: 1px solid rgba(255, 255, 255, 0.20);
+        padding: 4px 10px;
+        border-radius: 8px;
+      }
+
+      /* Stage 3-5: Sleek Synchronization & Verification */
+      #agy-boot-overlay .agy-sync-wrap {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        text-align: center;
+      }
+      #agy-boot-overlay .agy-icon-morph-box {
+        position: relative;
+        width: 104px;
+        height: 104px;
+        margin-bottom: 24px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      #agy-boot-overlay .agy-icon-outline-svg { position: absolute; inset: 0; width: 100%; height: 100%; transition: opacity 0.4s ease; }
       #agy-boot-overlay .agy-icon-outline-svg.fade-stroke { opacity: 0; }
-      #agy-boot-overlay .agy-icon-outline-path { fill: none; stroke: url(#agyBootStrokeGrad); stroke-width: 3.2; stroke-linecap: round; stroke-linejoin: round; filter: drop-shadow(0 0 6px rgba(255,255,255,0.28)); }
-      #agy-boot-overlay .agy-icon-outline-path.trace { animation: agyTraceOutline 1.05s cubic-bezier(0.35,0.05,0.25,1) forwards; }
+      #agy-boot-overlay .agy-icon-outline-path {
+        fill: none;
+        stroke: url(#agyBootStrokeGrad);
+        stroke-width: 3.4;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        filter: drop-shadow(0 0 12px rgba(192, 132, 252, 0.55));
+      }
+      #agy-boot-overlay .agy-icon-outline-path.trace { animation: agyTraceOutline 0.85s cubic-bezier(0.35, 0.05, 0.25, 1) forwards; }
       @keyframes agyTraceOutline { to { stroke-dashoffset: 0; } }
       #agy-boot-overlay .agy-icon-color-fill {
-        position: absolute; inset: 0; width: 100%; height: 100%; display: block; object-fit: fill;
-        clip-path: inset(85% 0 0 0); opacity: 0;
-        transition: clip-path 1.05s cubic-bezier(0.35,0.05,0.25,1), opacity 0.12s ease, filter 0.45s ease;
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+        clip-path: inset(85% 0 0 0);
+        opacity: 0;
+        transition: clip-path 0.8s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.15s ease, filter 0.4s ease;
       }
-      #agy-boot-overlay .agy-icon-color-fill.filled { clip-path: inset(13% 0 0 0); opacity: 1; filter: drop-shadow(0 0 14px rgba(59,130,246,0.28)); }
-
-      #agy-boot-overlay .agy-dot-grid-small { font-size: 10px; letter-spacing: 0.48em; color: #52525b; line-height: 1.8; }
-      #agy-boot-overlay .agy-hex-column {
-        position: absolute; right: 36px; top: 50%; transform: translateY(-50%); font-size: 9.5px; line-height: 1.85;
-        color: rgba(255,255,255,0.24); letter-spacing: 0.16em; text-align: right; pointer-events: none; opacity: 0; transition: opacity 0.3s ease;
+      #agy-boot-overlay .agy-icon-color-fill.filled {
+        clip-path: inset(0 0 0 0);
+        opacity: 1;
+        filter: drop-shadow(0 0 22px rgba(168, 85, 247, 0.45));
       }
-      #agy-boot-overlay .agy-hex-column.visible { opacity: 1; }
-
-      #agy-boot-overlay .agy-verify-ring-stage { position: relative; width: 390px; height: 390px; display: flex; align-items: center; justify-content: center; }
-      #agy-boot-overlay .agy-arc-svg { position: absolute; inset: 0; width: 100%; height: 100%; animation: agySpinCW 4.2s linear infinite; }
-      #agy-boot-overlay .agy-arc-svg-inner { position: absolute; inset: 28px; width: calc(100% - 56px); height: calc(100% - 56px); animation: agySpinCCW 5.5s linear infinite; }
-      #agy-boot-overlay .agy-orbit-dots { position: absolute; inset: 42px; border-radius: 50%; animation: agySpinCW 3.4s linear infinite; }
-      #agy-boot-overlay .agy-orbit-dot { position: absolute; width: 4px; height: 4px; border-radius: 50%; background: #60a5fa; }
-      #agy-boot-overlay .agy-orbit-dot.w { background: #ffffff; width: 3px; height: 3px; }
-      @keyframes agySpinCW { to { transform: rotate(360deg); } }
-      @keyframes agySpinCCW { to { transform: rotate(-360deg); } }
-
-      #agy-boot-overlay .agy-welcome-eyebrow { font-size: 16px; font-weight: 700; letter-spacing: 0.26em; color: #f4f4f5; margin-bottom: 10px; }
-      #agy-boot-overlay .agy-welcome-solid-box {
-        background: #ffffff; color: #050505; padding: 4px 18px; font-family: 'Segoe UI', system-ui, sans-serif;
-        font-size: 17px; font-weight: 800; letter-spacing: 0.16em; margin-bottom: 22px; box-shadow: 0 0 28px rgba(255,255,255,0.22);
+      #agy-boot-overlay .agy-sync-title {
+        font-size: 24px;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+        color: #ffffff;
+        margin-bottom: 8px;
       }
-      #agy-boot-overlay .agy-welcome-flare-wrap { position: relative; width: 260px; height: 58px; display: flex; align-items: center; justify-content: center; margin-bottom: 10px; }
-      #agy-boot-overlay .agy-welcome-flare-wrap img { width: 46px; height: 46px; object-fit: contain; position: relative; z-index: 2; }
+      #agy-boot-overlay .agy-sync-sub {
+        font-size: 15px;
+        font-weight: 500;
+        color: #a1a1aa;
+      }
+
+      /* Stage 6: Rhythm-Synced Grand Hero Welcome */
+      #agy-boot-overlay .agy-hero-welcome {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        text-align: center;
+      }
+      #agy-boot-overlay .agy-hero-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        background: rgba(168, 85, 247, 0.14);
+        border: 1px solid rgba(216, 180, 254, 0.30);
+        padding: 7px 16px;
+        border-radius: 999px;
+        font-family: 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
+        font-size: 12.5px;
+        font-weight: 600;
+        letter-spacing: 0.08em;
+        color: #e9d5ff;
+        margin-bottom: 22px;
+      }
+      #agy-boot-overlay .agy-hero-title {
+        font-size: clamp(36px, 4.2vw, 48px);
+        font-weight: 700;
+        letter-spacing: -0.03em;
+        line-height: 1.18;
+        margin: 0 0 14px;
+        background: linear-gradient(135deg, #ffffff 30%, #f3e8ff 68%, #c084fc 100%);
+        -webkit-background-clip: text;
+        background-clip: text;
+        -webkit-text-fill-color: transparent;
+      }
+      #agy-boot-overlay .agy-hero-id {
+        font-family: 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
+        font-size: 14.5px;
+        font-weight: 500;
+        letter-spacing: 0.05em;
+        color: #c4b5fd;
+      }
+
+      /* Footer & Clean Progress Bar */
+      #agy-boot-overlay .agy-footer-meta {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-size: 13.5px;
+        font-weight: 500;
+        color: #a1a1aa;
+      }
+      #agy-boot-overlay .agy-footer-id {
+        font-family: 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
+        font-size: 12.5px;
+        font-weight: 500;
+        color: #71717a;
+      }
+      #agy-boot-overlay .agy-eq-bars {
+        display: inline-flex;
+        align-items: flex-end;
+        gap: 2.5px;
+        height: 13px;
+      }
+      #agy-boot-overlay .agy-eq-bars span {
+        width: 2.5px;
+        border-radius: 2px;
+        background: linear-gradient(180deg, #e879f9, #a855f7);
+        animation: agyEqPulse 0.45s ease-in-out infinite alternate;
+      }
+      #agy-boot-overlay .agy-eq-bars span:nth-child(2) { animation-delay: 0.12s; }
+      #agy-boot-overlay .agy-eq-bars span:nth-child(3) { animation-delay: 0.24s; }
+      #agy-boot-overlay .agy-eq-bars span:nth-child(4) { animation-delay: 0.08s; }
+      @keyframes agyEqPulse { from { height: 4px; opacity: 0.5; } to { height: 13px; opacity: 1; } }
 
       #agy-boot-overlay .agy-bottom-progress-track {
-        position: absolute; left: 50%; transform: translateX(-50%); width: 33.33vw; max-width: 440px;
-        bottom: 4px; height: 2px; background: rgba(255,255,255,0.12);
+        position: absolute;
+        left: 50%;
+        transform: translateX(-50%);
+        width: min(360px, 38vw);
+        height: 3px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.08);
+        overflow: hidden;
       }
-      #agy-boot-overlay .agy-bottom-progress-bar { width: 0%; height: 100%; background: #ffffff; transition: width 0.55s cubic-bezier(0.22,1,0.36,1); }
-      #agy-boot-overlay .agy-eq-bars { display: inline-flex; align-items: flex-end; gap: 2px; height: 11px; margin-right: 10px; }
-      #agy-boot-overlay .agy-eq-bars span { width: 2px; background: #60a5fa; animation: agyEqPulse 0.9s ease-in-out infinite alternate; }
-      #agy-boot-overlay .agy-eq-bars span:nth-child(2) { animation-delay: 0.2s; }
-      #agy-boot-overlay .agy-eq-bars span:nth-child(3) { animation-delay: 0.4s; }
-      @keyframes agyEqPulse { from { height: 3px; opacity: 0.45; } to { height: 11px; opacity: 1; } }
+      #agy-boot-overlay .agy-bottom-progress-bar {
+        width: 0%;
+        height: 100%;
+        border-radius: 999px;
+        background: linear-gradient(90deg, #a855f7, #e879f9, #38bdf8);
+        box-shadow: 0 0 12px rgba(192, 132, 252, 0.65);
+        transition: width 0.5s cubic-bezier(0.22, 1, 0.36, 1);
+      }
+
+      /* 4-Method Multi-Factor Identity Hub */
+      #agy-boot-overlay .agy-boot-skip.is-locked {
+        cursor: default;
+        color: #c084fc;
+        border-color: rgba(192, 132, 252, 0.28);
+        background: rgba(168, 85, 247, 0.12);
+      }
+      #agy-boot-overlay .agy-mfa-card {
+        width: min(560px, 94vw);
+        padding: 30px 36px 28px;
+      }
+      #agy-boot-overlay .agy-mfa-operator-bar {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        padding: 12px 16px;
+        background: rgba(255, 255, 255, 0.035);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 14px;
+        margin-bottom: 18px;
+      }
+      #agy-boot-overlay .agy-mfa-op-left {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+      #agy-boot-overlay .agy-mfa-mini-av {
+        width: 38px;
+        height: 38px;
+        border-radius: 50%;
+        background: url("${avatarUrl}") center center / cover no-repeat;
+        border: 1.5px solid rgba(216, 180, 254, 0.55);
+        flex-shrink: 0;
+      }
+      #agy-boot-overlay .agy-mfa-tabs {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 5px;
+        background: rgba(0, 0, 0, 0.38);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 12px;
+        padding: 4px;
+        margin-bottom: 22px;
+      }
+      #agy-boot-overlay .agy-mfa-tab {
+        border: none;
+        background: transparent;
+        color: #a1a1aa;
+        font-family: inherit;
+        font-size: 13px;
+        font-weight: 600;
+        padding: 8px 6px;
+        border-radius: 9px;
+        cursor: pointer;
+        transition: all 0.18s ease;
+        white-space: nowrap;
+      }
+      #agy-boot-overlay .agy-mfa-tab:hover { color: #f4f4f5; }
+      #agy-boot-overlay .agy-mfa-tab.active {
+        background: linear-gradient(135deg, rgba(147, 51, 234, 0.42), rgba(107, 33, 168, 0.48));
+        color: #ffffff;
+        box-shadow: inset 0 1px 0 rgba(243, 232, 255, 0.25), 0 4px 12px rgba(0, 0, 0, 0.35);
+      }
+      #agy-boot-overlay .agy-mfa-pane {
+        display: none;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        min-height: 214px;
+        text-align: center;
+      }
+      #agy-boot-overlay .agy-mfa-pane.active { display: flex; }
+
+      /* Method 1: Live AI Face ID Scanner */
+      #agy-boot-overlay .agy-face-ring-wrap {
+        position: relative;
+        width: 138px;
+        height: 138px;
+        border-radius: 50%;
+        padding: 3.5px;
+        background: conic-gradient(from 0deg, #a855f7, #e879f9, #38bdf8, transparent 70%, #a855f7);
+        animation: agySpinRing 2.4s linear infinite;
+        margin-bottom: 14px;
+        box-shadow: 0 0 32px rgba(168, 85, 247, 0.32);
+      }
+      #agy-boot-overlay .agy-face-ring-wrap.matched {
+        background: linear-gradient(135deg, #34d399, #10b981, #a855f7);
+        animation: none;
+        box-shadow: 0 0 36px rgba(52, 211, 153, 0.52);
+      }
+      #agy-boot-overlay .agy-face-ring-wrap.denied {
+        background: linear-gradient(135deg, #fb7185, #e11d48);
+        animation: none;
+        box-shadow: 0 0 32px rgba(244, 63, 94, 0.48);
+      }
+      @keyframes agySpinRing { to { transform: rotate(360deg); } }
+      #agy-boot-overlay .agy-face-lens {
+        position: absolute;
+        inset: 3.5px;
+        border-radius: 50%;
+        overflow: hidden;
+        background: #070510;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      /* Counter-rotate inner lens when parent ring spins? Keep ring as ::before pseudo so video never spins! */
+      #agy-boot-overlay .agy-face-ring-box {
+        position: relative;
+        width: 140px;
+        height: 140px;
+        margin-bottom: 14px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      #agy-boot-overlay .agy-face-spinner {
+        position: absolute;
+        inset: 0;
+        border-radius: 50%;
+        background: conic-gradient(from 0deg, #a855f7, #f3e8ff, #38bdf8, rgba(168,85,247,0.12) 72%, #a855f7);
+        animation: agySpinRing 2.2s linear infinite;
+        box-shadow: 0 0 28px rgba(168, 85, 247, 0.32);
+      }
+      #agy-boot-overlay .agy-face-ring-box.matched .agy-face-spinner {
+        background: linear-gradient(135deg, #34d399, #10b981);
+        animation: none;
+        box-shadow: 0 0 34px rgba(52, 211, 153, 0.55);
+      }
+      #agy-boot-overlay .agy-face-ring-box.denied .agy-face-spinner {
+        background: linear-gradient(135deg, #fb7185, #e11d48);
+        animation: none;
+        box-shadow: 0 0 30px rgba(244, 63, 94, 0.5);
+      }
+      #agy-boot-overlay .agy-face-viewport {
+        position: relative;
+        z-index: 2;
+        width: 132px;
+        height: 132px;
+        border-radius: 50%;
+        overflow: hidden;
+        background: #070510;
+      }
+      #agy-boot-overlay #agy-face-video {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        transform: scaleX(-1);
+        display: block;
+      }
+      #agy-boot-overlay #agy-face-hud-canvas {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        transform: scaleX(-1);
+        pointer-events: none;
+      }
+      #agy-boot-overlay .agy-face-scanbar {
+        position: absolute;
+        left: 0;
+        right: 0;
+        height: 2px;
+        background: linear-gradient(90deg, transparent, rgba(232, 121, 249, 0.9), transparent);
+        box-shadow: 0 0 10px rgba(192, 132, 252, 0.85);
+        animation: agyFaceSweep 1.8s ease-in-out infinite alternate;
+        pointer-events: none;
+      }
+      @keyframes agyFaceSweep { from { top: 14%; } to { top: 86%; } }
+      #agy-boot-overlay .agy-mfa-status {
+        font-size: 14.5px;
+        font-weight: 600;
+        color: #e4e4e7;
+        margin-bottom: 4px;
+      }
+      #agy-boot-overlay .agy-mfa-sub {
+        font-size: 12.5px;
+        color: #a1a1aa;
+      }
+      #agy-boot-overlay .agy-ghost-link {
+        margin-top: 10px;
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        color: #d8b4fe;
+        border-radius: 999px;
+        padding: 5px 13px;
+        font-family: inherit;
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: background 0.16s ease, border-color 0.16s ease;
+      }
+      #agy-boot-overlay .agy-ghost-link:hover {
+        background: rgba(168, 85, 247, 0.18);
+        border-color: rgba(192, 132, 252, 0.4);
+        color: #ffffff;
+      }
+
+      /* Method 2: 6-Digit Stealth PIN Orbs & Compact Pad */
+      #agy-boot-overlay .agy-pin-orbs {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 14px;
+        margin: 6px 0 16px;
+      }
+      #agy-boot-overlay .agy-pin-orbs.shake {
+        animation: agyPinShake 0.36s cubic-bezier(0.36, 0.07, 0.19, 0.97) both;
+      }
+      @keyframes agyPinShake {
+        15%, 85% { transform: translateX(-6px); }
+        30%, 70% { transform: translateX(6px); }
+        45%, 55% { transform: translateX(-4px); }
+      }
+      #agy-boot-overlay .agy-pin-orb {
+        width: 15px;
+        height: 15px;
+        border-radius: 50%;
+        border: 1.6px solid rgba(255, 255, 255, 0.28);
+        background: rgba(255, 255, 255, 0.03);
+        transition: all 0.14s cubic-bezier(0.22, 1, 0.36, 1);
+      }
+      #agy-boot-overlay .agy-pin-orb.filled {
+        background: #d8b4fe;
+        border-color: #f3e8ff;
+        transform: scale(1.16);
+        box-shadow: 0 0 14px rgba(192, 132, 252, 0.85);
+      }
+      #agy-boot-overlay .agy-pin-orb.error {
+        background: #fb7185;
+        border-color: #fda4af;
+        box-shadow: 0 0 14px rgba(244, 63, 94, 0.8);
+      }
+      #agy-boot-overlay .agy-pin-orb.ok {
+        background: #34d399;
+        border-color: #a7f3d0;
+        box-shadow: 0 0 16px rgba(52, 211, 153, 0.85);
+      }
+      #agy-boot-overlay .agy-pin-grid {
+        display: grid;
+        grid-template-columns: repeat(6, 1fr);
+        gap: 7px;
+        width: 100%;
+        max-width: 380px;
+        margin-top: 10px;
+      }
+      #agy-boot-overlay .agy-pin-key {
+        height: 38px;
+        border-radius: 10px;
+        border: 1px solid rgba(255, 255, 255, 0.09);
+        background: rgba(255, 255, 255, 0.04);
+        color: #f4f4f5;
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 14.5px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: background 0.14s ease, transform 0.1s ease;
+      }
+      #agy-boot-overlay .agy-pin-key:hover {
+        background: rgba(168, 85, 247, 0.20);
+        border-color: rgba(192, 132, 252, 0.35);
+      }
+      #agy-boot-overlay .agy-pin-key:active { transform: scale(0.95); }
+
+      /* Method 4: Engineer Terminal & Quantum Hold */
+      #agy-boot-overlay .agy-term-box {
+        width: 100%;
+        background: #06050c;
+        border: 1px solid rgba(192, 132, 252, 0.24);
+        border-radius: 13px;
+        padding: 15px 18px;
+        text-align: left;
+        font-family: 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
+        box-sizing: border-box;
+        margin-bottom: 14px;
+      }
+      #agy-boot-overlay .agy-term-line {
+        font-size: 12.5px;
+        color: #a1a1aa;
+        margin-bottom: 10px;
+      }
+      #agy-boot-overlay .agy-term-input-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      #agy-boot-overlay .agy-term-prompt {
+        font-size: 13px;
+        font-weight: 600;
+        color: #c084fc;
+        white-space: nowrap;
+      }
+      #agy-boot-overlay #agy-term-pass {
+        flex: 1;
+        background: transparent;
+        border: none;
+        outline: none;
+        color: #ffffff;
+        font-family: inherit;
+        font-size: 14px;
+        letter-spacing: 0.12em;
+      }
+      #agy-boot-overlay .agy-hold-btn {
+        position: relative;
+        width: 100%;
+        height: 44px;
+        border-radius: 12px;
+        overflow: hidden;
+        border: 1px solid rgba(192, 132, 252, 0.28);
+        background: rgba(255, 255, 255, 0.04);
+        color: #e9d5ff;
+        font-family: inherit;
+        font-size: 13.5px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      #agy-boot-overlay .agy-hold-fill {
+        position: absolute;
+        inset: 0;
+        width: 0%;
+        background: linear-gradient(90deg, rgba(147, 51, 234, 0.65), rgba(56, 189, 248, 0.65));
+        pointer-events: none;
+      }
+      #agy-boot-overlay .agy-hold-btn span {
+        position: relative;
+        z-index: 1;
+      }
     `;
     document.head.appendChild(bootStyle);
 
@@ -1635,137 +2440,207 @@
 
     const overlay = document.createElement('section');
     overlay.id = 'agy-boot-overlay';
-    overlay.setAttribute('aria-label', 'Boot Sequence');
+    overlay.setAttribute('aria-label', 'Antigravity Welcome');
     overlay.innerHTML = `
-      <div class="agy-boot-starfield"></div>
+      <div class="agy-boot-art"></div>
       <div class="agy-boot-vignette"></div>
-      <div class="agy-splash-sheen" id="agy-splash-sheen"></div>
-      <div class="agy-hud-scanline" id="agy-hud-scanline"></div>
+      <div class="agy-boot-grid"></div>
 
       <header class="agy-boot-header">
-        <div class="agy-boot-brand">
-          <strong>ANTIGRAVITY</strong>
-          <span class="sub-line">SYNTHESIZE INTELLIGENCE</span>
-          <div class="agy-boot-rev">
-            <span>REV 0.1.9</span>
-            <span>•</span>
-            <span class="blue-rev" id="agy-hud-clock">WEB PROFILE 00:00:00</span>
-          </div>
+        <div class="agy-brand-row">
+          <img src="${iconColorUrl}" alt="Antigravity" />
+          <span class="agy-brand-name">Antigravity</span>
+          <span class="agy-brand-tag">Studio 2.0</span>
         </div>
-        <button class="agy-boot-skip" id="agy-boot-skip" type="button">SKIP ▸</button>
+        <button class="agy-boot-skip" id="agy-boot-skip" type="button">Skip · Esc</button>
       </header>
 
       <div class="agy-boot-stage-wrap">
         <div class="agy-boot-stage active" id="agy-stage-0">
-          <img class="agy-splash-logo" id="agy-splash-logo" src="${iconColorUrl}" alt="Antigravity" />
-          <div class="agy-splash-wordmark">ANTIGRAVITY</div>
-          <div class="agy-splash-caption">SYNTHESIZE INTELLIGENCE</div>
+          <img class="agy-splash-logo" src="${iconColorUrl}" alt="Antigravity" />
+          <div class="agy-splash-wordmark">Antigravity</div>
+          <div class="agy-splash-caption">Next-Generation Engineering Workspace</div>
         </div>
 
         <div class="agy-boot-stage" id="agy-stage-1">
-          <div style="margin-bottom:6px"><span class="agy-hud-title" data-stagger="26">YÊU CẦU QUYỀN TRUY CẬP</span></div>
-          <div class="agy-hud-subtitle" data-stagger="14">ACCESS PERMISSION REQUIRED</div>
-          <button class="agy-hud-btn" id="agy-btn-grant" type="button">
-            <span>CẤP QUYỀN &nbsp; GRANT ACCESS</span>
-          </button>
-          <div class="agy-hud-hint">Nhấn Enter / Space hoặc bấm nút để tiếp tục</div>
+          <div class="agy-dialog-card">
+            <div class="agy-status-chip">
+              <span class="agy-status-dot"></span>
+              <span>WORKSPACE SESSION</span>
+            </div>
+            <h1 class="agy-card-heading">Initialize Workspace</h1>
+            <p class="agy-card-desc">Establish local interface telemetry and synchronize your personal environment configuration.</p>
+            <button class="agy-primary-btn" id="agy-btn-grant" type="button">
+              <span>Grant Access</span>
+              <span class="agy-keycap">Enter ↵</span>
+            </button>
+          </div>
         </div>
 
         <div class="agy-boot-stage" id="agy-stage-2">
-          <div style="margin-bottom:6px"><span class="agy-hud-title" data-stagger="26">XÁC MINH DANH TÍNH</span></div>
-          <div class="agy-hud-subtitle" data-stagger="14">IDENTITY VERIFICATION</div>
-          <div class="agy-id-table">
-            <div class="agy-id-row"><span>TÊN TRUY CẬP / OPERATOR</span><span>SENSEI</span></div>
-            <div class="agy-id-row"><span>MÃ ĐỊNH DANH / UID</span><span>0042</span></div>
-            <div class="agy-id-row"><span>CẤP QUYỀN / LEVEL</span><span>∞</span></div>
+          <div class="agy-dialog-card agy-mfa-card">
+            <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:14px;">
+              <div>
+                <div class="agy-profile-eyebrow" style="margin-bottom:2px;">MULTI-FACTOR IDENTITY LOCK</div>
+                <h1 class="agy-card-heading" style="margin:0;font-size:25px;">Identity Verification</h1>
+              </div>
+              <span style="font-family:'JetBrains Mono',monospace;font-size:11.5px;color:#a1a1aa;">SCRYPT · ONNX</span>
+            </div>
+
+            <div class="agy-mfa-operator-bar">
+              <div class="agy-mfa-op-left">
+                <div class="agy-mfa-mini-av"></div>
+                <div>
+                  <div style="font-size:12px;color:#a1a1aa;font-weight:500;">Operator</div>
+                  <div style="font-size:16.5px;font-weight:700;color:#ffffff;letter-spacing:-0.01em;">Binh Phan</div>
+                </div>
+              </div>
+              <span class="agy-spec-value-code" style="font-size:12px;padding:5px 10px;">BINHPHAN-SOFTWARE-ENGINEER</span>
+            </div>
+
+            <div class="agy-mfa-tabs" role="tablist">
+              <button class="agy-mfa-tab active" data-auth-tab="face" type="button">Face ID</button>
+              <button class="agy-mfa-tab" data-auth-tab="pin" type="button">Passcode</button>
+              <button class="agy-mfa-tab" data-auth-tab="hello" type="button">Win Hello</button>
+              <button class="agy-mfa-tab" data-auth-tab="term" type="button">Terminal</button>
+            </div>
+
+            <!-- Pane 1: Live AI Face ID -->
+            <div class="agy-mfa-pane active" id="agy-pane-face">
+              <div class="agy-face-ring-box" id="agy-face-ring-box">
+                <div class="agy-face-spinner"></div>
+                <div class="agy-face-viewport">
+                  <video id="agy-face-video" autoplay muted playsinline></video>
+                  <canvas id="agy-face-hud-canvas" width="132" height="132"></canvas>
+                  <div class="agy-face-scanbar" id="agy-face-scanbar"></div>
+                </div>
+              </div>
+              <div class="agy-mfa-status" id="agy-face-status">Initializing camera sensor...</div>
+              <div class="agy-mfa-sub" id="agy-face-sub">Auto-switches to Passcode if camera is off or covered</div>
+              <button class="agy-ghost-link" id="agy-face-enroll-btn" type="button">Calibrate HD Face ID</button>
+            </div>
+
+            <!-- Pane 2: 6-Digit Stealth Passcode -->
+            <div class="agy-mfa-pane" id="agy-pane-pin">
+              <div class="agy-mfa-status" id="agy-pin-status">Enter 6-Digit Passcode</div>
+              <div class="agy-mfa-sub" id="agy-pin-sub">Type on your keyboard or use the keypad below</div>
+              <div class="agy-pin-orbs" id="agy-pin-orbs">
+                <span class="agy-pin-orb"></span>
+                <span class="agy-pin-orb"></span>
+                <span class="agy-pin-orb"></span>
+                <span class="agy-pin-orb"></span>
+                <span class="agy-pin-orb"></span>
+                <span class="agy-pin-orb"></span>
+              </div>
+              <div class="agy-pin-grid" id="agy-pin-grid">
+                <button class="agy-pin-key" data-digit="1" type="button">1</button>
+                <button class="agy-pin-key" data-digit="2" type="button">2</button>
+                <button class="agy-pin-key" data-digit="3" type="button">3</button>
+                <button class="agy-pin-key" data-digit="4" type="button">4</button>
+                <button class="agy-pin-key" data-digit="5" type="button">5</button>
+                <button class="agy-pin-key" data-digit="6" type="button">6</button>
+                <button class="agy-pin-key" data-digit="7" type="button">7</button>
+                <button class="agy-pin-key" data-digit="8" type="button">8</button>
+                <button class="agy-pin-key" data-digit="9" type="button">9</button>
+                <button class="agy-pin-key" data-digit="0" type="button">0</button>
+                <button class="agy-pin-key" data-action="back" type="button">⌫</button>
+                <button class="agy-pin-key" data-action="clear" type="button" style="font-size:11.5px;">CLR</button>
+              </div>
+            </div>
+
+            <!-- Pane 3: Windows Hello Hardware Biometrics -->
+            <div class="agy-mfa-pane" id="agy-pane-hello">
+              <div style="width:68px;height:68px;border-radius:18px;background:rgba(168,85,247,0.14);border:1px solid rgba(192,132,252,0.32);display:flex;align-items:center;justify-content:center;margin-bottom:16px;box-shadow:0 8px 24px rgba(126,34,206,0.28);">
+                <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#e9d5ff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 11c0 3.517-1.009 6.799-2.753 9.571m-3.44-2.04l.054-.09A13.916 13.916 0 008 11a4 4 0 118 0c0 1.017-.07 2.019-.203 3m-2.118 6.844A21.88 21.88 0 0015.171 17m3.839 1.132c.645-2.266.99-4.659.99-7.132A8 8 0 008 4.07M3 15.364c.64-1.319 1-2.8 1-4.364 0-1.457.39-2.823 1.07-4"/></svg>
+              </div>
+              <div class="agy-mfa-status" id="agy-hello-status">Windows Hello Hardware Security</div>
+              <div class="agy-mfa-sub" id="agy-hello-sub" style="margin-bottom:18px;">Verify with Fingerprint sensor, IR Face, or Windows PIN</div>
+              <button class="agy-primary-btn" id="agy-hello-trigger-btn" type="button" style="max-width:340px;height:46px;font-size:14.5px;">
+                <span>Prompt Windows Hello</span>
+                <span class="agy-keycap">Enter ↵</span>
+              </button>
+            </div>
+
+            <!-- Pane 4: Engineer Terminal & Secret Key Chord -->
+            <div class="agy-mfa-pane" id="agy-pane-term">
+              <div class="agy-term-box">
+                <div class="agy-term-line" id="agy-term-log">binhphan@antigravity ~ $ auth --verify-operator</div>
+                <div class="agy-term-input-row">
+                  <span class="agy-term-prompt">passphrase &gt;</span>
+                  <input id="agy-term-pass" type="password" autocomplete="off" spellcheck="false" placeholder="Enter secret passphrase..." />
+                </div>
+              </div>
+              <button class="agy-hold-btn" id="agy-chord-trigger-btn" type="button" style="${serverHasKeyChord ? '' : 'opacity:0.58;cursor:default;'}">
+                <div class="agy-hold-fill" id="agy-chord-fill"></div>
+                <span id="agy-chord-label">${serverHasKeyChord ? 'Authenticate via 3-Step Secret Key Chord' : 'Secret Key Chord Not Configured (Set in Theme Studio)'}</span>
+              </button>
+            </div>
           </div>
-          <button class="agy-hud-btn" id="agy-btn-confirm" type="button">
-            <span>XÁC NHẬN &nbsp; CONFIRM IDENTITY</span>
-          </button>
-          <div class="agy-hud-hint">Nhấn Enter / Space hoặc bấm nút để xác nhận</div>
         </div>
 
         <div class="agy-boot-stage" id="agy-stage-morph">
-          <div style="margin-bottom:6px"><span class="agy-hud-title" id="agy-morph-title" data-stagger="16">ĐANG TIẾP NHẬN YÊU CẦU</span></div>
-          <div class="agy-hud-subtitle" id="agy-morph-sub" data-stagger="10" style="margin-bottom:10px">ACCESS REQUEST RECEIVED</div>
-          <div class="agy-icon-morph-box">
-            <svg class="agy-icon-outline-svg" id="agy-icon-outline-svg" viewBox="0 0 256 256">
-              <defs>
-                <linearGradient id="agyBootStrokeGrad" x1="10%" y1="90%" x2="88%" y2="12%">
-                  <stop offset="0%" stop-color="#3b82f6" />
-                  <stop offset="38%" stop-color="#22c55e" />
-                  <stop offset="68%" stop-color="#f59e0b" />
-                  <stop offset="86%" stop-color="#ef4444" />
-                  <stop offset="100%" stop-color="#3b82f6" />
-                </linearGradient>
-              </defs>
-              <path
-                id="agy-boot-outline-path"
-                class="agy-icon-outline-path"
-                d="M 116.50,42.00 Q 111.00,44.00 105.00,49.50 Q 99.00,55.00 94.00,64.00 Q 89.00,73.00 74.50,119.50 Q 60.00,166.00 53.50,178.00 Q 47.00,190.00 40.00,198.00 Q 33.00,206.00 32.50,209.00 Q 32.00,212.00 34.00,213.50 Q 36.00,215.00 39.00,215.00 Q 42.00,215.00 49.00,211.00 Q 56.00,207.00 64.50,198.00 Q 73.00,189.00 82.50,173.00 Q 92.00,157.00 98.00,149.50 Q 104.00,142.00 110.00,138.50 Q 116.00,135.00 125.50,134.50 Q 135.00,134.00 141.50,137.00 Q 148.00,140.00 152.50,144.50 Q 157.00,149.00 169.00,168.50 Q 181.00,188.00 187.50,195.50 Q 194.00,203.00 200.50,208.00 Q 207.00,213.00 210.00,214.00 Q 213.00,215.00 216.50,214.50 Q 220.00,214.00 221.00,213.00 Q 222.00,212.00 221.50,208.50 Q 221.00,205.00 212.00,194.00 Q 203.00,183.00 197.00,170.00 Q 191.00,157.00 182.50,127.00 Q 174.00,97.00 166.50,78.50 Q 159.00,60.00 153.50,53.50 Q 148.00,47.00 144.00,44.50 Q 140.00,42.00 131.00,41.00 Q 122.00,40.00 116.50,42.00 Z"
-              />
-            </svg>
-            <img id="agy-boot-color-fill" class="agy-icon-color-fill" src="${iconColorUrl}" alt="Antigravity" />
+          <div class="agy-sync-wrap">
+            <div class="agy-icon-morph-box">
+              <svg class="agy-icon-outline-svg" id="agy-icon-outline-svg" viewBox="0 0 256 256">
+                <defs>
+                  <linearGradient id="agyBootStrokeGrad" x1="10%" y1="90%" x2="88%" y2="12%">
+                    <stop offset="0%" stop-color="#f3e8ff" />
+                    <stop offset="45%" stop-color="#c084fc" />
+                    <stop offset="80%" stop-color="#38bdf8" />
+                    <stop offset="100%" stop-color="#a855f7" />
+                  </linearGradient>
+                </defs>
+                <path
+                  id="agy-boot-outline-path"
+                  class="agy-icon-outline-path"
+                  d="M 116.50,42.00 Q 111.00,44.00 105.00,49.50 Q 99.00,55.00 94.00,64.00 Q 89.00,73.00 74.50,119.50 Q 60.00,166.00 53.50,178.00 Q 47.00,190.00 40.00,198.00 Q 33.00,206.00 32.50,209.00 Q 32.00,212.00 34.00,213.50 Q 36.00,215.00 39.00,215.00 Q 42.00,215.00 49.00,211.00 Q 56.00,207.00 64.50,198.00 Q 73.00,189.00 82.50,173.00 Q 92.00,157.00 98.00,149.50 Q 104.00,142.00 110.00,138.50 Q 116.00,135.00 125.50,134.50 Q 135.00,134.00 141.50,137.00 Q 148.00,140.00 152.50,144.50 Q 157.00,149.00 169.00,168.50 Q 181.00,188.00 187.50,195.50 Q 194.00,203.00 200.50,208.00 Q 207.00,213.00 210.00,214.00 Q 213.00,215.00 216.50,214.50 Q 220.00,214.00 221.00,213.00 Q 222.00,212.00 221.50,208.50 Q 221.00,205.00 212.00,194.00 Q 203.00,183.00 197.00,170.00 Q 191.00,157.00 182.50,127.00 Q 174.00,97.00 166.50,78.50 Q 159.00,60.00 153.50,53.50 Q 148.00,47.00 144.00,44.50 Q 140.00,42.00 131.00,41.00 Q 122.00,40.00 116.50,42.00 Z"
+                />
+              </svg>
+              <img id="agy-boot-color-fill" class="agy-icon-color-fill" src="${iconColorUrl}" alt="Antigravity" />
+            </div>
+            <div class="agy-sync-title" id="agy-morph-title">Synchronizing Workspace...</div>
+            <div class="agy-sync-sub" id="agy-morph-sub">Loading graphics pipeline and interface configuration</div>
           </div>
-          <div class="agy-dot-grid-small">ANTIGRAVITY<br />· · · · · · · · · ·</div>
         </div>
 
         <div class="agy-boot-stage" id="agy-stage-5">
-          <div class="agy-verify-ring-stage">
-            <svg class="agy-arc-svg" viewBox="0 0 320 320">
-              <circle cx="160" cy="160" r="146" fill="none" stroke="#ffffff" stroke-width="3.2" stroke-dasharray="430 140 160 220" stroke-linecap="round" />
-              <circle cx="160" cy="14" r="4.5" fill="#ffffff" />
-            </svg>
-            <svg class="agy-arc-svg-inner" viewBox="0 0 264 264">
-              <circle cx="132" cy="132" r="122" fill="none" stroke="rgba(255,255,255,0.22)" stroke-width="1" stroke-dasharray="6 10" />
-            </svg>
-            <div class="agy-orbit-dots">
-              <div class="agy-orbit-dot" style="top:12%;left:32%"></div>
-              <div class="agy-orbit-dot w" style="top:28%;right:14%"></div>
-              <div class="agy-orbit-dot" style="bottom:18%;left:22%"></div>
-              <div class="agy-orbit-dot w" style="bottom:24%;right:28%"></div>
+          <div class="agy-sync-wrap">
+            <div class="agy-icon-morph-box">
+              <img src="${iconColorUrl}" alt="Antigravity" style="width:92px;height:92px;object-fit:contain;filter:drop-shadow(0 0 26px rgba(192,132,252,0.55));" />
             </div>
-            <div>
-              <div class="agy-hud-title" data-stagger="24" style="font-size:17px;letter-spacing:0.1em;margin-bottom:6px">HOÀN TẤT · ĐÃ XÁC THỰC</div>
-              <div class="agy-hud-subtitle" data-stagger="14" style="margin-bottom:0;font-size:9px;letter-spacing:0.24em">READ COMPLETE · VERIFIED</div>
-            </div>
+            <div class="agy-sync-title">Identity Verified</div>
+            <div class="agy-sync-sub" style="color:#d8b4fe;">Clearance granted · Binh Phan</div>
           </div>
         </div>
 
         <div class="agy-boot-stage" id="agy-stage-6">
-          <div class="agy-welcome-eyebrow" data-stagger="28">WELCOME TO</div>
-          <div class="agy-welcome-solid-box agy-welcome-reveal" style="animation-delay:240ms">ANTIGRAVITY</div>
-          <div class="agy-welcome-flare-wrap agy-welcome-reveal" style="animation-delay:360ms">
-            <img src="${iconColorUrl}" alt="Antigravity" />
+          <div class="agy-hero-welcome">
+            <div class="agy-hero-badge">
+              <span class="agy-eq-bars"><span></span><span></span><span></span><span></span></span>
+              <span>WORKSPACE READY</span>
+            </div>
+            <h1 class="agy-hero-title">Welcome back, Binh Phan</h1>
+            <div class="agy-hero-id">BINHPHAN-SOFTWARE-ENGINEER</div>
           </div>
-          <div class="agy-dot-grid-small agy-welcome-reveal" style="margin-bottom:8px;animation-delay:460ms">A N T I G R A V I T Y</div>
-          <div class="agy-hud-hint agy-welcome-reveal" style="color:#a1a1aa;letter-spacing:0.2em;animation-delay:540ms">CHÀO MỪNG SENSEI • SESSION READY</div>
         </div>
       </div>
 
-      <div class="agy-hex-column" id="agy-hex-column"></div>
-
       <footer class="agy-boot-footer">
-        <div style="display:flex;align-items:center">
-          <div class="agy-eq-bars"><span></span><span></span><span></span></div>
-          <span id="agy-boot-step-label">[ 01 / 06 ] AUTHORIZATION</span>
+        <div class="agy-footer-meta">
+          <span class="agy-eq-bars"><span></span><span></span><span></span><span></span></span>
+          <span id="agy-boot-status-bottom">Awaiting operator authorization</span>
         </div>
-        <span id="agy-boot-status-bottom">AWAITING OPERATOR CONSENT</span>
-        <span>ID CONFIRMED : 0042</span>
         <div class="agy-bottom-progress-track">
           <div class="agy-bottom-progress-bar" id="agy-bottom-progress"></div>
         </div>
+        <span class="agy-footer-id">BINHPHAN-SOFTWARE-ENGINEER</span>
       </footer>
     `;
     document.body.appendChild(overlay);
 
-    const splashSheen = document.getElementById('agy-splash-sheen');
-    const hudScanline = document.getElementById('agy-hud-scanline');
-    const stepLabel = document.getElementById('agy-boot-step-label');
+    const skipBtn = document.getElementById('agy-boot-skip');
     const statusBottom = document.getElementById('agy-boot-status-bottom');
     const bottomProgress = document.getElementById('agy-bottom-progress');
-    const hexColumn = document.getElementById('agy-hex-column');
-    const hudClock = document.getElementById('agy-hud-clock');
     const morphTitle = document.getElementById('agy-morph-title');
     const morphSub = document.getElementById('agy-morph-sub');
     const iconOutlineSvg = document.getElementById('agy-icon-outline-svg');
@@ -1777,23 +2652,29 @@
 
     let currentStage = 0;
     let bootActx = null;
-    const bootStartMs = performance.now();
+    let activeAuthTab = 'face';
+    let authUnlocked = false;
+    let pinBuffer = '';
+    let pinBusy = false;
+    let pendingFaceEnroll = false;
+    let helloBusy = false;
 
-    function playClickSfx(freq = 640, dur = 0.06, vol = 0.045) {
+    function playPinTick(freq = 1040, vol = 0.045) {
       try {
         bootActx = bootActx || new (window.AudioContext || window.webkitAudioContext)();
         if (bootActx.state === 'suspended') bootActx.resume();
+        const now = bootActx.currentTime;
         const osc = bootActx.createOscillator();
         const g = bootActx.createGain();
-        osc.type = 'triangle';
-        osc.frequency.setValueAtTime(freq, bootActx.currentTime);
-        osc.frequency.exponentialRampToValueAtTime(freq * 1.45, bootActx.currentTime + dur);
-        g.gain.setValueAtTime(vol, bootActx.currentTime);
-        g.gain.exponentialRampToValueAtTime(0.001, bootActx.currentTime + dur);
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(freq, now);
+        osc.frequency.exponentialRampToValueAtTime(freq * 0.55, now + 0.028);
+        g.gain.setValueAtTime(vol, now);
+        g.gain.exponentialRampToValueAtTime(0.001, now + 0.032);
         osc.connect(g);
         g.connect(bootActx.destination);
-        osc.start();
-        osc.stop(bootActx.currentTime + dur);
+        osc.start(now);
+        osc.stop(now + 0.035);
       } catch (e) {}
     }
 
@@ -1803,92 +2684,597 @@
       if (!src) return;
       try {
         const audio = new Audio(src);
-        audio.volume = 0.92;
+        audio.volume = 0.94;
         window.__AGY_BOOT_AUDIO__ = audio;
         audio.play().catch(() => {});
       } catch (e) {}
     }
 
-    function triggerScanline() {
-      hudScanline.classList.remove('sweep');
-      void hudScanline.offsetWidth;
-      hudScanline.classList.add('sweep');
-    }
+    let lockoutUntilEpoch = 0;
+    let chordCaptureMode = false;
+    let chordSteps = [];
 
-    function startHexStream(active) {
-      if (window.__AGY_BOOT_HEX__) {
-        clearInterval(window.__AGY_BOOT_HEX__);
-        window.__AGY_BOOT_HEX__ = null;
+    function startLockoutCountdown(seconds, targetEl, restoreText) {
+      const durSec = Math.max(1, Math.ceil(Number(seconds) || 30));
+      lockoutUntilEpoch = Date.now() + durSec * 1000;
+      if (window.__AGY_LOCKOUT_TIMER__) {
+        clearInterval(window.__AGY_LOCKOUT_TIMER__);
       }
-      hexColumn.classList.toggle('visible', active);
-      if (!active) return;
-      const gen = () => {
-        const lines = [];
-        for (let i = 0; i < 6; i++) {
-          const val = Math.floor(Math.random() * 0xffff).toString(16).toUpperCase().padStart(4, '0');
-          lines.push(`0x${val} :: READ`);
+      const updateMsg = () => {
+        const rem = Math.ceil((lockoutUntilEpoch - Date.now()) / 1000);
+        if (rem <= 0) {
+          clearInterval(window.__AGY_LOCKOUT_TIMER__);
+          window.__AGY_LOCKOUT_TIMER__ = null;
+          lockoutUntilEpoch = 0;
+          pinBusy = false;
+          if (targetEl && !authUnlocked) {
+            targetEl.textContent = restoreText;
+            targetEl.style.color = '#e4e4e7';
+          }
+          renderPinOrbs();
+          return;
         }
-        hexColumn.innerHTML = lines.join('<br>');
+        if (targetEl && !authUnlocked) {
+          targetEl.textContent = `Too many failed attempts · Locked for ${rem}s`;
+          targetEl.style.color = '#fb7185';
+        }
       };
-      gen();
-      window.__AGY_BOOT_HEX__ = setInterval(gen, 110);
+      updateMsg();
+      window.__AGY_LOCKOUT_TIMER__ = setInterval(updateMsg, 500);
     }
 
-    function applyCharStagger(el, stepMs = 24, baseDelayMs = 0) {
-      if (!el) return;
-      const raw = el.dataset.rawText || el.textContent.trim();
-      el.dataset.rawText = raw;
-      el.innerHTML = '';
-      Array.from(raw).forEach((ch, idx) => {
-        if (ch === ' ') {
-          const sp = document.createElement('span');
-          sp.className = 'agy-stagger-space';
-          el.appendChild(sp);
-        } else {
-          const span = document.createElement('span');
-          span.className = 'agy-stagger-char';
-          span.textContent = ch;
-          span.style.animationDelay = `${baseDelayMs + idx * stepMs}ms`;
-          el.appendChild(span);
+    async function completeIdentityAuth(methodLabel, unlockProof = '', adminTicket = '') {
+      if (authUnlocked || currentStage !== 2) return;
+      if (adminTicket) rememberAdminTicket(adminTicket);
+
+      if (mfaRequired && HAS_VAULT_DAEMON) {
+        if (!unlockProof) return;
+        try {
+          const confirmResp = await daemonFetch('/auth/confirm-unlock', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ unlockProof })
+          });
+          if (!confirmResp.ok) return;
+          const confirmData = await confirmResp.json();
+          if (!confirmData || !confirmData.unlocked) return;
+        } catch (e) {
+          return;
+        }
+        authUnlocked = true;
+        sessionAuthenticated = true;
+        releaseWorkspaceLock();
+      } else {
+        authUnlocked = true;
+      }
+
+      stopAuthCamera();
+      if (skipBtn) {
+        skipBtn.classList.remove('is-locked');
+        skipBtn.textContent = 'Skip · Esc';
+      }
+      if (statusBottom && methodLabel) {
+        statusBottom.textContent = `Verified via ${methodLabel} · Binh Phan`;
+      }
+      playTawaVoice(2);
+      const st2 = document.getElementById('agy-stage-2');
+      window.__AGY_BOOT_TIMERS__.push(setTimeout(() => st2 && st2.classList.add('wipe-out'), 180));
+      window.__AGY_BOOT_TIMERS__.push(setTimeout(() => runAutoSequenceAfterConfirm(), 400));
+    }
+
+    function renderPinOrbs(stateClass = '') {
+      const orbsWrap = document.getElementById('agy-pin-orbs');
+      if (!orbsWrap) return;
+      const orbs = orbsWrap.querySelectorAll('.agy-pin-orb');
+      orbs.forEach((orb, idx) => {
+        orb.className = 'agy-pin-orb';
+        if (stateClass) {
+          orb.classList.add(stateClass);
+        } else if (idx < pinBuffer.length) {
+          orb.classList.add('filled');
         }
       });
     }
 
-    function showStage(idx, withCharAnim = true) {
+    async function runLiveFaceEnrollment(enrollTicket = '', fallbackUnlockProof = '') {
+      pendingFaceEnroll = false;
+      switchAuthTab('face');
+      const faceStatus = document.getElementById('agy-face-status');
+      const faceSub = document.getElementById('agy-face-sub');
+      const enrollBtn = document.getElementById('agy-face-enroll-btn');
+      if (enrollBtn) enrollBtn.style.display = 'none';
+      if (faceStatus) faceStatus.textContent = 'Look straight at camera · Capturing HD profile...';
+      if (faceSub) faceSub.textContent = 'Sampling 4 live multi-angle biometric frames';
+
+      const videoEl = document.getElementById('agy-face-video');
+      for (let w = 0; w < 16; w++) {
+        if (videoEl && videoEl.readyState >= 2 && videoEl.videoWidth > 0) break;
+        await new Promise((r) => setTimeout(r, 150));
+      }
+      if (!videoEl || videoEl.readyState < 2 || !videoEl.videoWidth) {
+        if (faceStatus) faceStatus.textContent = 'Camera unavailable for enrollment';
+        if (fallbackUnlockProof) {
+          setTimeout(() => completeIdentityAuth('Passcode', fallbackUnlockProof, enrollTicket), 400);
+        } else {
+          switchAuthTab('pin', 'Camera unavailable · Enter Passcode');
+        }
+        return;
+      }
+
+      if (window.__AGY_FACE_POLL_TIMER__) {
+        clearTimeout(window.__AGY_FACE_POLL_TIMER__);
+        window.__AGY_FACE_POLL_TIMER__ = null;
+      }
+      if (window.__AGY_FACE_FALLBACK_TIMER__) {
+        clearTimeout(window.__AGY_FACE_FALLBACK_TIMER__);
+        window.__AGY_FACE_FALLBACK_TIMER__ = null;
+      }
+
+      const capCanvas = document.createElement('canvas');
+      capCanvas.width = 400;
+      capCanvas.height = Math.max(240, Math.round(400 * (videoEl.videoHeight / Math.max(1, videoEl.videoWidth))));
+      const cctx = capCanvas.getContext('2d');
+      const frames = [];
+      for (let i = 0; i < 4; i++) {
+        if (cctx) {
+          cctx.drawImage(videoEl, 0, 0, capCanvas.width, capCanvas.height);
+          frames.push(capCanvas.toDataURL('image/jpeg', 0.86));
+        }
+        playPinTick(980 + i * 140, 0.05);
+        await new Promise((r) => setTimeout(r, 250));
+      }
+
+      try {
+        const activeTicket = enrollTicket || getValidAdminTicket();
+        const res = await daemonFetch('/auth/face-enroll', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ adminTicket: activeTicket, images: frames })
+        });
+        const data = await res.json();
+        const ringBox = document.getElementById('agy-face-ring-box');
+        if (data && data.ok) {
+          if (ringBox) ringBox.classList.add('matched');
+          if (faceStatus) faceStatus.textContent = `HD Face ID Bound · Binh Phan (${data.samples} samples)`;
+          if (faceSub) faceSub.textContent = '128-D SFace biometric template saved locally';
+          const proof = data.unlockProof || fallbackUnlockProof;
+          const nextTicket = data.adminTicket || activeTicket;
+          setTimeout(() => completeIdentityAuth('HD Face ID', proof, nextTicket), 450);
+          return;
+        }
+        if (faceStatus && data && data.error) {
+          faceStatus.textContent = data.error;
+          faceStatus.style.color = '#fb7185';
+        }
+      } catch (e) {}
+      if (fallbackUnlockProof) {
+        setTimeout(() => completeIdentityAuth('Passcode', fallbackUnlockProof, enrollTicket), 650);
+      }
+    }
+
+    async function handlePinDigit(digit) {
+      if (pinBusy || authUnlocked || currentStage !== 2) return;
+      if (lockoutUntilEpoch > Date.now()) return;
+      if (!HAS_VAULT_DAEMON) {
+        const pinStatus = document.getElementById('agy-pin-status');
+        if (pinStatus) {
+          pinStatus.textContent = 'Run .\\scripts\\install-win.ps1 once to activate Security Vault';
+          pinStatus.style.color = '#fb7185';
+        }
+        return;
+      }
+      if (pinBuffer.length >= 6) return;
+      pinBuffer += String(digit);
+      playPinTick(880 + pinBuffer.length * 75, 0.05);
+      renderPinOrbs();
+      if (pinBuffer.length < 6) return;
+
+      pinBusy = true;
+      const entered = pinBuffer;
+      const pinStatus = document.getElementById('agy-pin-status');
+      const orbsWrap = document.getElementById('agy-pin-orbs');
+
+      try {
+        const resp = await daemonFetch('/auth/verify-pin', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ secret: entered })
+        });
+        const data = await resp.json();
+
+        if (resp.status === 429 || (data && data.lockedOut)) {
+          renderPinOrbs('error');
+          playPinTick(220, 0.09);
+          pinBuffer = '';
+          if (orbsWrap) {
+            orbsWrap.classList.remove('shake');
+            void orbsWrap.offsetWidth;
+            orbsWrap.classList.add('shake');
+          }
+          startLockoutCountdown(
+            data.retryAfterSec || 30,
+            pinStatus,
+            pendingFaceEnroll ? 'Confirm Passcode to Calibrate Face ID' : 'Enter 6-Digit Passcode'
+          );
+          return;
+        }
+
+        if (data && data.verified && data.unlockProof) {
+          rememberAdminTicket(data.adminTicket);
+          renderPinOrbs('ok');
+          if (pinStatus) {
+            pinStatus.textContent = pendingFaceEnroll ? 'Passcode Verified · Starting Camera...' : 'Passcode Verified · Access Granted';
+            pinStatus.style.color = '#34d399';
+          }
+          if (pendingFaceEnroll) {
+            pinBuffer = '';
+            pinBusy = false;
+            setTimeout(() => runLiveFaceEnrollment(data.adminTicket, data.unlockProof), 260);
+          } else {
+            setTimeout(() => completeIdentityAuth('Passcode', data.unlockProof, data.adminTicket), 220);
+          }
+          return;
+        }
+
+        renderPinOrbs('error');
+        playPinTick(240, 0.08);
+        if (pinStatus) {
+          const remTxt = typeof (data && data.remainingAttempts) === 'number'
+            ? `Invalid Passcode · ${data.remainingAttempts} attempt${data.remainingAttempts === 1 ? '' : 's'} left`
+            : 'Invalid Passcode · Try Again';
+          pinStatus.textContent = remTxt;
+          pinStatus.style.color = '#fb7185';
+        }
+        if (orbsWrap) {
+          orbsWrap.classList.remove('shake');
+          void orbsWrap.offsetWidth;
+          orbsWrap.classList.add('shake');
+        }
+        setTimeout(() => {
+          pinBuffer = '';
+          pinBusy = false;
+          renderPinOrbs();
+          if (pinStatus && lockoutUntilEpoch <= Date.now()) {
+            pinStatus.textContent = pendingFaceEnroll ? 'Confirm Passcode to Calibrate Face ID' : 'Enter 6-Digit Passcode';
+            pinStatus.style.color = '#e4e4e7';
+          }
+        }, 520);
+      } catch (err) {
+        pinBuffer = '';
+        pinBusy = false;
+        renderPinOrbs('error');
+        if (pinStatus) {
+          pinStatus.textContent = 'Daemon Vault unreachable · Run install-win.ps1';
+          pinStatus.style.color = '#fb7185';
+        }
+      }
+    }
+
+    async function startFaceScanner() {
+      stopAuthCamera();
+      const ringBox = document.getElementById('agy-face-ring-box');
+      const videoEl = document.getElementById('agy-face-video');
+      const hudCanvas = document.getElementById('agy-face-hud-canvas');
+      const faceStatus = document.getElementById('agy-face-status');
+      const faceSub = document.getElementById('agy-face-sub');
+      if (ringBox) ringBox.classList.remove('matched', 'denied');
+      if (!HAS_VAULT_DAEMON) {
+        if (faceStatus) {
+          faceStatus.textContent = 'Run .\\scripts\\install-win.ps1 once to activate Hardened Vault';
+          faceStatus.style.color = '#e9d5ff';
+        }
+        if (faceSub) faceSub.textContent = 'Preview mode active until background daemon restarts';
+        return;
+      }
+      if (faceStatus) {
+        faceStatus.textContent = 'Opening camera sensor...';
+        faceStatus.style.color = '#e4e4e7';
+      }
+      if (faceSub) faceSub.textContent = 'Auto-switches to Passcode if camera is off or covered';
+
+      const base = getDaemonBaseUrl();
+      if (!base || !navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
+        switchAuthTab('pin', 'Camera unavailable · Switched to Passcode');
+        return;
+      }
+
+      let stream = null;
+      try {
+        stream = await Promise.race([
+          navigator.mediaDevices.getUserMedia({
+            video: { width: { ideal: 480 }, height: { ideal: 480 }, facingMode: 'user' },
+            audio: false
+          }),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('Camera timeout')), 2800))
+        ]);
+      } catch (err) {
+        if (activeAuthTab === 'face' && !authUnlocked && currentStage === 2) {
+          switchAuthTab('pin', 'Camera off or blocked · Enter 6-Digit Passcode');
+        }
+        return;
+      }
+
+      if (activeAuthTab !== 'face' || authUnlocked || currentStage !== 2) {
+        try { stream.getTracks().forEach((t) => t.stop()); } catch (e) {}
+        return;
+      }
+
+      window.__AGY_AUTH_STREAM__ = stream;
+      if (videoEl) {
+        videoEl.srcObject = stream;
+        videoEl.play().catch(() => {});
+      }
+      if (faceStatus) faceStatus.textContent = 'Scanning live biometric signature...';
+
+      let darkStreak = 0;
+      let anyFaceSeen = false;
+      let lastVideoTime = -1;
+      const sampleCanvas = document.createElement('canvas');
+      sampleCanvas.width = 320;
+      sampleCanvas.height = 240;
+      const sctx = sampleCanvas.getContext('2d');
+      const hctx = hudCanvas ? hudCanvas.getContext('2d') : null;
+
+      window.__AGY_FACE_FALLBACK_TIMER__ = setTimeout(() => {
+        if (!anyFaceSeen && activeAuthTab === 'face' && !authUnlocked && currentStage === 2 && !pendingFaceEnroll) {
+          switchAuthTab('pin', 'No face in view · Switched to Passcode');
+        }
+      }, 4200);
+
+      const pollFrame = async () => {
+        if (activeAuthTab !== 'face' || authUnlocked || currentStage !== 2 || !window.__AGY_AUTH_STREAM__) return;
+        if (!videoEl || videoEl.readyState < 2 || !videoEl.videoWidth || videoEl.currentTime === lastVideoTime) {
+          window.__AGY_FACE_POLL_TIMER__ = setTimeout(pollFrame, 160);
+          return;
+        }
+        lastVideoTime = videoEl.currentTime;
+        sampleCanvas.height = Math.max(180, Math.round(320 * (videoEl.videoHeight / Math.max(1, videoEl.videoWidth))));
+        if (sctx) sctx.drawImage(videoEl, 0, 0, sampleCanvas.width, sampleCanvas.height);
+        const frameData = sampleCanvas.toDataURL('image/jpeg', 0.80);
+
+        try {
+          const resp = await daemonFetch('/auth/face-verify', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ image: frameData })
+          });
+          if (!resp.ok) {
+            switchAuthTab('pin', 'Biometric service unavailable · Switched to Passcode');
+            return;
+          }
+          const res = await resp.json();
+          if (activeAuthTab !== 'face' || authUnlocked || currentStage !== 2) return;
+
+          if (hctx && hudCanvas) {
+            hctx.clearRect(0, 0, hudCanvas.width, hudCanvas.height);
+          }
+
+          if (res.darkFrame) {
+            darkStreak++;
+            if (darkStreak >= 3 && !pendingFaceEnroll) {
+              switchAuthTab('pin', 'Camera covered or dark · Switched to Passcode');
+              return;
+            }
+          } else {
+            darkStreak = 0;
+          }
+
+          if (res.hasFace) {
+            anyFaceSeen = true;
+            if (hctx && hudCanvas && Array.isArray(res.landmarks)) {
+              hctx.fillStyle = res.matched ? '#34d399' : '#e879f9';
+              res.landmarks.forEach((pt) => {
+                const lx = pt[0] * hudCanvas.width;
+                const ly = pt[1] * hudCanvas.height;
+                hctx.beginPath();
+                hctx.arc(lx, ly, 2.3, 0, Math.PI * 2);
+                hctx.fill();
+              });
+            }
+
+            if (res.tooSmall) {
+              if (ringBox) ringBox.classList.remove('matched', 'denied');
+              if (faceStatus) {
+                faceStatus.textContent = 'Move closer to camera sensor...';
+                faceStatus.style.color = '#e9d5ff';
+              }
+            } else if (res.staticReplay) {
+              if (ringBox) ringBox.classList.add('denied');
+              if (faceStatus) {
+                faceStatus.textContent = 'Static frame rejected · Live presence required';
+                faceStatus.style.color = '#fb7185';
+              }
+            } else if (!res.enrolled) {
+              if (faceStatus) faceStatus.textContent = 'Face Detected · Click Calibrate HD Face below';
+              if (faceSub) faceSub.textContent = 'Or press any number key to unlock with Passcode';
+            } else if (res.matched) {
+              if (ringBox) ringBox.classList.remove('denied');
+              const streak = Number(res.matchStreak) || 1;
+              const confPct = Math.min(99, Math.round(84 + Math.max(0, res.similarity - (res.threshold || 0.44)) * 45));
+              if (faceStatus) {
+                faceStatus.textContent = res.streakConfirmed
+                  ? `Identity Confirmed · Binh Phan (${confPct}%)`
+                  : `Verifying live liveness (${streak}/3) · ${confPct}%`;
+                faceStatus.style.color = '#34d399';
+              }
+              if (res.streakConfirmed && res.unlockProof) {
+                if (ringBox) ringBox.classList.add('matched');
+                const scanBar = document.getElementById('agy-face-scanbar');
+                if (scanBar) scanBar.style.display = 'none';
+                setTimeout(() => completeIdentityAuth('AI Face ID', res.unlockProof, res.adminTicket), 260);
+                return;
+              }
+            } else {
+              if (ringBox) ringBox.classList.add('denied');
+              if (faceStatus) {
+                faceStatus.textContent = 'Unrecognized Operator · Access Blocked';
+                faceStatus.style.color = '#fb7185';
+              }
+              if (faceSub) faceSub.textContent = 'Only Binh Phan is authorized, or use Passcode';
+            }
+          } else {
+            if (ringBox) ringBox.classList.remove('denied');
+            if (faceStatus) {
+              faceStatus.textContent = 'Scanning live biometric signature...';
+              faceStatus.style.color = '#e4e4e7';
+            }
+          }
+        } catch (err) {
+          switchAuthTab('pin', 'Biometric bridge offline · Switched to Passcode');
+          return;
+        }
+
+        if (activeAuthTab === 'face' && !authUnlocked && currentStage === 2) {
+          window.__AGY_FACE_POLL_TIMER__ = setTimeout(pollFrame, 195);
+        }
+      };
+
+      window.__AGY_FACE_POLL_TIMER__ = setTimeout(pollFrame, 240);
+    }
+
+    async function triggerWindowsHelloAuth() {
+      if (helloBusy || authUnlocked || currentStage !== 2) return;
+      const base = getDaemonBaseUrl();
+      const hStatus = document.getElementById('agy-hello-status');
+      const hSub = document.getElementById('agy-hello-sub');
+      if (!base || !HAS_VAULT_DAEMON) {
+        if (hStatus) hStatus.textContent = 'Run .\\scripts\\install-win.ps1 once to activate Windows Hello';
+        return;
+      }
+      helloBusy = true;
+      if (hStatus) {
+        hStatus.textContent = 'Waiting for Windows Hello Security Prompt...';
+        hStatus.style.color = '#e9d5ff';
+      }
+      if (hSub) hSub.textContent = 'Scan your fingerprint, IR face, or enter Windows PIN';
+      try {
+        const res = await daemonFetch('/auth/windows-hello', { method: 'POST' });
+        const data = await res.json();
+        helloBusy = false;
+        if (data && data.verified && data.unlockProof) {
+          if (hStatus) {
+            hStatus.textContent = 'Windows Hello Verified · Access Granted';
+            hStatus.style.color = '#34d399';
+          }
+          setTimeout(() => completeIdentityAuth('Windows Hello', data.unlockProof, data.adminTicket), 220);
+        } else {
+          if (hStatus) {
+            hStatus.textContent = 'Windows Hello Cancelled or Not Verified';
+            hStatus.style.color = '#fb7185';
+          }
+          if (hSub) hSub.textContent = 'Click button below or press Enter to retry';
+        }
+      } catch (e) {
+        helloBusy = false;
+        if (hStatus) {
+          hStatus.textContent = 'Restart daemon once to activate Windows Hello endpoint';
+          hStatus.style.color = '#fb7185';
+        }
+      }
+    }
+
+    function resetChordUi() {
+      chordCaptureMode = false;
+      chordSteps = [];
+      const chordFill = document.getElementById('agy-chord-fill');
+      const chordLabel = document.getElementById('agy-chord-label');
+      if (chordFill) chordFill.style.width = '0%';
+      if (chordLabel && !authUnlocked) {
+        chordLabel.textContent = serverHasKeyChord
+          ? 'Authenticate via 3-Step Secret Key Chord'
+          : 'Secret Key Chord Not Configured (Set in Theme Studio)';
+      }
+    }
+
+    function switchAuthTab(tabKey, reasonSub = '') {
+      activeAuthTab = tabKey;
+      resetChordUi();
+      overlay.querySelectorAll('.agy-mfa-tab').forEach((btn) => {
+        btn.classList.toggle('active', btn.dataset.authTab === tabKey);
+      });
+      ['face', 'pin', 'hello', 'term'].forEach((k) => {
+        const pane = document.getElementById(`agy-pane-${k}`);
+        if (pane) pane.classList.toggle('active', k === tabKey);
+      });
+
+      if (tabKey !== 'face') {
+        stopAuthCamera();
+      }
+
+      if (tabKey === 'face') {
+        startFaceScanner();
+      } else if (tabKey === 'pin') {
+        pinBuffer = '';
+        pinBusy = lockoutUntilEpoch > Date.now();
+        renderPinOrbs();
+        const pinStatus = document.getElementById('agy-pin-status');
+        const pinSub = document.getElementById('agy-pin-sub');
+        if (pinStatus && lockoutUntilEpoch <= Date.now()) {
+          pinStatus.textContent = pendingFaceEnroll ? 'Confirm Passcode to Calibrate Face ID' : 'Enter 6-Digit Passcode';
+          pinStatus.style.color = '#e4e4e7';
+        }
+        if (pinSub) {
+          pinSub.textContent = reasonSub || 'Type 6 digits on keyboard or click keypad below';
+        }
+      } else if (tabKey === 'hello') {
+        triggerWindowsHelloAuth();
+      } else if (tabKey === 'term') {
+        const passInput = document.getElementById('agy-term-pass');
+        if (passInput) {
+          passInput.value = '';
+          setTimeout(() => passInput.focus(), 40);
+        }
+      }
+    }
+
+    function isSkipBlocked() {
+      return mfaRequired && !authUnlocked && HAS_VAULT_DAEMON;
+    }
+
+    function showStage(idx) {
       currentStage = idx;
       const ids = ['agy-stage-0', 'agy-stage-1', 'agy-stage-2', 'agy-stage-morph', 'agy-stage-morph', 'agy-stage-5', 'agy-stage-6'];
       const targetId = ids[idx];
       ['agy-stage-0', 'agy-stage-1', 'agy-stage-2', 'agy-stage-morph', 'agy-stage-5', 'agy-stage-6'].forEach((id) => {
         const el = document.getElementById(id);
         if (!el) return;
-        el.classList.remove('wipe-out', 'stage-fade-out');
+        el.classList.remove('wipe-out');
         el.classList.toggle('active', id === targetId);
       });
-      if (withCharAnim && idx > 0) {
-        const activeEl = document.getElementById(targetId);
-        if (activeEl) {
-          activeEl.querySelectorAll('[data-stagger]').forEach((el, tIdx) => {
-            applyCharStagger(el, parseInt(el.getAttribute('data-stagger') || '24', 10), tIdx * 90);
-          });
-        }
+
+      const lockEnforced = isSkipBlocked();
+      if (skipBtn) {
+        skipBtn.classList.toggle('is-locked', lockEnforced);
+        skipBtn.textContent = lockEnforced ? 'Locked · MFA Required' : 'Skip · Esc';
       }
+
+      if (idx === 2) {
+        if (!mfaRequired && !forceReplay) {
+          completeIdentityAuth('Quick Pass');
+          return;
+        }
+        switchAuthTab('face');
+      } else {
+        stopAuthCamera();
+      }
+
       const meta = [
-        ['[ 00 / 06 ] INITIALIZING', 'LOADING KERNEL...', 10],
-        ['[ 01 / 06 ] AUTHORIZATION', 'AWAITING OPERATOR CONSENT', 24],
-        ['[ 02 / 06 ] IDENTITY CHECK', 'UID 0042 / LEVEL ∞ READY', 42],
-        ['[ 03 / 06 ] ACCESS VECTOR', 'SYNCHRONIZING NEURAL CORE', 58],
-        ['[ 04 / 06 ] PERMISSION STREAM', 'STREAMING CLEARANCE KEYS', 74],
-        ['[ 05 / 06 ] VERIFY', 'PERMISSION AUTHORIZED', 90],
-        ['[ 06 / 06 ] WELCOME', 'SENSEI SESSION ACTIVE', 100]
+        ['Initializing core kernel...', 12],
+        ['Awaiting operator authorization', 28],
+        ['Multi-factor verification · Binh Phan', 52],
+        ['Synchronizing workspace...', 72],
+        ['Applying visual pipeline...', 84],
+        ['Identity verified', 94],
+        ['Session active · Binh Phan', 100]
       ];
-      stepLabel.textContent = meta[idx][0];
-      statusBottom.textContent = meta[idx][1];
-      bottomProgress.style.width = `${meta[idx][2]}%`;
+      statusBottom.textContent = meta[idx][0];
+      bottomProgress.style.width = `${meta[idx][1]}%`;
     }
 
     function finishBoot(instant = false) {
+      if (isSkipBlocked()) return;
       clearBootTimers();
-      startHexStream(false);
+      stopAuthCamera();
       window.__AGY_BOOT_FINISHED__ = true;
       if (instant) {
         stopBootAudio();
@@ -1905,171 +3291,403 @@
           scheduleRevealWhenReady(false);
           window.__AGY_BOOT_TIMERS__.push(setTimeout(() => {
             overlay.style.display = 'none';
-          }, 700));
-        }, 340)
+          }, 680));
+        }, 260)
       );
     }
 
     function runAutoSequenceAfterConfirm() {
-      morphTitle.dataset.rawText = 'ĐANG TIẾP NHẬN YÊU CẦU';
-      morphTitle.textContent = 'ĐANG TIẾP NHẬN YÊU CẦU';
-      morphSub.dataset.rawText = 'ACCESS REQUEST RECEIVED';
-      morphSub.textContent = 'ACCESS REQUEST RECEIVED';
+      morphTitle.textContent = 'Synchronizing Workspace...';
+      morphSub.textContent = 'Loading graphics pipeline and interface configuration';
       iconOutlineSvg.classList.remove('fade-stroke');
       colorFillImg.classList.remove('filled');
       outlinePath.classList.remove('trace');
       outlinePath.style.strokeDashoffset = String(outlineTotalLen);
-      showStage(3, true);
+      showStage(3);
       void outlinePath.offsetWidth;
       outlinePath.classList.add('trace');
-      playClickSfx(520, 0.06, 0.045);
 
       let fillPhaseStarted = false;
       const startColorFillStage = () => {
         if (fillPhaseStarted || !overlay.isConnected || overlay.classList.contains('done')) return;
         fillPhaseStarted = true;
 
-        // Fill immediately on stroke completion while swapping the caption concurrently
-        morphTitle.dataset.rawText = 'BẮT ĐẦU ĐỌC QUYỀN HẠN';
-        morphTitle.textContent = 'BẮT ĐẦU ĐỌC QUYỀN HẠN';
-        morphSub.dataset.rawText = 'PERMISSION READ STARTED';
-        morphSub.textContent = 'PERMISSION READ STARTED';
-        showStage(4, true);
-        startHexStream(true);
+        morphTitle.textContent = 'Environment Configured';
+        morphSub.textContent = 'Binh Phan · BINHPHAN-SOFTWARE-ENGINEER';
+        showStage(4);
         void colorFillImg.offsetWidth;
         colorFillImg.classList.add('filled');
-        playClickSfx(620, 0.05, 0.04);
 
-        window.__AGY_BOOT_TIMERS__.push(setTimeout(() => iconOutlineSvg.classList.add('fade-stroke'), 520));
+        window.__AGY_BOOT_TIMERS__.push(setTimeout(() => iconOutlineSvg.classList.add('fade-stroke'), 420));
 
         window.__AGY_BOOT_TIMERS__.push(setTimeout(() => {
-          startHexStream(false);
-          showStage(5, true);
-          triggerScanline();
-          playClickSfx(780, 0.08, 0.05);
+          showStage(5);
           playTawaVoice(3);
-        }, 1250));
+        }, 920));
 
         window.__AGY_BOOT_TIMERS__.push(setTimeout(() => {
-          const st5 = document.getElementById('agy-stage-5');
-          if (st5) st5.classList.add('stage-fade-out');
-        }, 2950));
-
-        window.__AGY_BOOT_TIMERS__.push(setTimeout(() => {
-          showStage(6, true);
-          playClickSfx(880, 0.1, 0.045);
+          showStage(6);
           playTawaVoice(4);
-        }, 3620));
+        }, 1820));
 
-        window.__AGY_BOOT_TIMERS__.push(setTimeout(() => finishBoot(false), 5850));
+        // Synchronized to the exact 1.42s studio cinematic impact climax of cyber_voice4.mp3
+        window.__AGY_BOOT_TIMERS__.push(setTimeout(() => finishBoot(false), 1820 + 1420));
       };
 
       outlinePath.addEventListener('animationend', startColorFillStage, { once: true });
-      window.__AGY_BOOT_TIMERS__.push(setTimeout(startColorFillStage, 1080));
+      window.__AGY_BOOT_TIMERS__.push(setTimeout(startColorFillStage, 880));
     }
 
-    window.__AGY_BOOT_CLOCK__ = setInterval(() => {
-      const sec = Math.floor((performance.now() - bootStartMs) / 1000);
-      const mm = String(Math.floor(sec / 60)).padStart(2, '0');
-      const ss = String(sec % 60).padStart(2, '0');
-      hudClock.textContent = `WEB PROFILE 00:${mm}:${ss}`;
-    }, 250);
-
-    showStage(0, false);
-    window.__AGY_BOOT_TIMERS__.push(setTimeout(() => {
-      splashSheen.classList.remove('run');
-      void splashSheen.offsetWidth;
-      splashSheen.classList.add('run');
-    }, 1050));
-
-    window.__AGY_BOOT_TIMERS__.push(setTimeout(() => {
+    function jumpStraightToMfaGate() {
+      if (currentStage >= 2) return;
+      if (Array.isArray(window.__AGY_BOOT_TIMERS__)) {
+        window.__AGY_BOOT_TIMERS__.forEach((id) => clearTimeout(id));
+        window.__AGY_BOOT_TIMERS__ = [];
+      }
       overlay.classList.add('hud-mode');
-      showStage(1, true);
-      triggerScanline();
-    }, 2600));
+      showStage(2);
+    }
+
+    if (jumpToMfa || (!st.bootIntro && mfaRequired && !forceReplay)) {
+      overlay.classList.add('hud-mode');
+      showStage(2);
+    } else {
+      showStage(0);
+      window.__AGY_BOOT_TIMERS__.push(setTimeout(() => {
+        overlay.classList.add('hud-mode');
+        showStage(1);
+      }, 1750));
+    }
 
     document.getElementById('agy-btn-grant').addEventListener('click', (e) => {
       if (currentStage !== 1) return;
       e.currentTarget.classList.add('triggered');
-      playClickSfx(680, 0.06, 0.05);
       playTawaVoice(1);
       const st1 = document.getElementById('agy-stage-1');
-      window.__AGY_BOOT_TIMERS__.push(setTimeout(() => st1 && st1.classList.add('wipe-out'), 240));
-      window.__AGY_BOOT_TIMERS__.push(setTimeout(() => showStage(2, true), 580));
+      window.__AGY_BOOT_TIMERS__.push(setTimeout(() => st1 && st1.classList.add('wipe-out'), 150));
+      window.__AGY_BOOT_TIMERS__.push(setTimeout(() => showStage(2), 360));
     });
 
-    document.getElementById('agy-btn-confirm').addEventListener('click', (e) => {
-      if (currentStage !== 2) return;
-      e.currentTarget.classList.add('triggered');
-      playClickSfx(820, 0.06, 0.05);
-      playTawaVoice(2);
-      const st2 = document.getElementById('agy-stage-2');
-      window.__AGY_BOOT_TIMERS__.push(setTimeout(() => st2 && st2.classList.add('wipe-out'), 240));
-      window.__AGY_BOOT_TIMERS__.push(setTimeout(() => runAutoSequenceAfterConfirm(), 580));
+    // Bind 4-Method Auth Switcher Tabs & Controls
+    overlay.querySelectorAll('.agy-mfa-tab').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        pendingFaceEnroll = false;
+        switchAuthTab(btn.dataset.authTab);
+      });
     });
 
-    document.getElementById('agy-boot-skip').addEventListener('click', () => finishBoot(true));
+    const enrollFaceBtn = document.getElementById('agy-face-enroll-btn');
+    if (enrollFaceBtn) {
+      enrollFaceBtn.addEventListener('click', () => {
+        pendingFaceEnroll = true;
+        switchAuthTab('pin', 'Verify current 6-digit PIN once to calibrate HD Face ID');
+      });
+    }
+
+    const pinGrid = document.getElementById('agy-pin-grid');
+    if (pinGrid) {
+      pinGrid.addEventListener('click', (e) => {
+        const btn = e.target.closest('.agy-pin-key');
+        if (!btn || pinBusy) return;
+        if (btn.dataset.digit !== undefined) {
+          handlePinDigit(btn.dataset.digit);
+        } else if (btn.dataset.action === 'back') {
+          pinBuffer = pinBuffer.slice(0, -1);
+          playPinTick(620, 0.04);
+          renderPinOrbs();
+        } else if (btn.dataset.action === 'clear') {
+          pinBuffer = '';
+          playPinTick(520, 0.04);
+          renderPinOrbs();
+        }
+      });
+    }
+
+    const helloBtn = document.getElementById('agy-hello-trigger-btn');
+    if (helloBtn) {
+      helloBtn.addEventListener('click', () => triggerWindowsHelloAuth());
+    }
+
+    const termPassInput = document.getElementById('agy-term-pass');
+    const termLog = document.getElementById('agy-term-log');
+    if (termPassInput) {
+      termPassInput.addEventListener('keydown', async (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          e.stopPropagation();
+          if (lockoutUntilEpoch > Date.now()) return;
+          if (!HAS_VAULT_DAEMON) {
+            if (termLog) {
+              termLog.textContent = 'auth: run .\\scripts\\install-win.ps1 once to activate vault';
+              termLog.style.color = '#fb7185';
+            }
+            return;
+          }
+          const val = termPassInput.value;
+          try {
+            const resp = await daemonFetch('/auth/verify-pass', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ secret: val })
+            });
+            const data = await resp.json();
+            if (resp.status === 429 || (data && data.lockedOut)) {
+              playPinTick(220, 0.09);
+              termPassInput.value = '';
+              startLockoutCountdown(data.retryAfterSec || 30, termLog, 'binhphan@antigravity ~ $ auth --verify-operator');
+              return;
+            }
+            if (data && data.verified && data.unlockProof) {
+              if (termLog) {
+                termLog.textContent = '[OK] Clearance granted: BINHPHAN-SOFTWARE-ENGINEER';
+                termLog.style.color = '#34d399';
+              }
+              completeIdentityAuth('Engineer Terminal', data.unlockProof, data.adminTicket);
+            } else {
+              playPinTick(240, 0.08);
+              termPassInput.value = '';
+              if (termLog) {
+                const rem = typeof (data && data.remainingAttempts) === 'number'
+                  ? ` (${data.remainingAttempts} left)`
+                  : '';
+                termLog.textContent = `auth: invalid passphrase${rem} — try again`;
+                termLog.style.color = '#fb7185';
+              }
+            }
+          } catch (err) {
+            if (termLog) {
+              termLog.textContent = 'auth: daemon vault unreachable';
+              termLog.style.color = '#fb7185';
+            }
+          }
+        }
+      });
+    }
+
+    const chordBtn = document.getElementById('agy-chord-trigger-btn');
+    const chordFill = document.getElementById('agy-chord-fill');
+    const chordLabel = document.getElementById('agy-chord-label');
+    if (chordBtn) {
+      chordBtn.addEventListener('click', () => {
+        if (!serverHasKeyChord || authUnlocked || currentStage !== 2) return;
+        if (lockoutUntilEpoch > Date.now()) return;
+        chordCaptureMode = true;
+        chordSteps = [];
+        if (termPassInput) termPassInput.blur();
+        if (chordFill) chordFill.style.width = '10%';
+        if (chordLabel) chordLabel.textContent = 'Press Secret Key Combo 1 of 3... (Esc to cancel)';
+        playPinTick(740, 0.045);
+      });
+    }
+
+    async function handleChordKeyEvent(e) {
+      const combo = serializeKeyCombo(e);
+      if (!combo) return;
+      e.preventDefault();
+      e.stopPropagation();
+      chordSteps.push(combo);
+      playPinTick(780 + chordSteps.length * 110, 0.05);
+      if (chordFill) chordFill.style.width = `${Math.round((chordSteps.length / 3) * 100)}%`;
+      if (chordSteps.length < 3) {
+        if (chordLabel) chordLabel.textContent = `Press Secret Key Combo ${chordSteps.length + 1} of 3...`;
+        return;
+      }
+      const candidateChord = chordSteps.join('>');
+      chordCaptureMode = false;
+      chordSteps = [];
+      try {
+        const resp = await daemonFetch('/auth/verify-chord', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ secret: candidateChord })
+        });
+        const data = await resp.json();
+        if (resp.status === 429 || (data && data.lockedOut)) {
+          resetChordUi();
+          startLockoutCountdown(data.retryAfterSec || 30, chordLabel, 'Authenticate via 3-Step Secret Key Chord');
+          return;
+        }
+        if (data && data.verified && data.unlockProof) {
+          if (chordLabel) chordLabel.textContent = 'Secret Key Chord Verified · Access Granted';
+          completeIdentityAuth('Secret Key Chord', data.unlockProof, data.adminTicket);
+        } else {
+          playPinTick(230, 0.08);
+          if (chordFill) chordFill.style.width = '0%';
+          if (chordLabel) chordLabel.textContent = 'Invalid Key Chord Sequence · Click to Retry';
+        }
+      } catch (err) {
+        resetChordUi();
+      }
+    }
+
+    skipBtn.addEventListener('click', () => {
+      if (isSkipBlocked()) {
+        if (currentStage < 2) jumpStraightToMfaGate();
+        return;
+      }
+      finishBoot(true);
+    });
 
     window.__AGY_BOOT_KEYDOWN__ = (e) => {
       if (overlay.classList.contains('done')) return;
-      if (e.key === 'Enter' || e.key === ' ') {
-        if (currentStage === 1) {
+
+      // Strict workspace shortcut & focus containment while locked
+      if (isSkipBlocked()) {
+        if (/^F(?:[1-9]|1[0-2])$/.test(e.key)) {
           e.preventDefault();
           e.stopPropagation();
-          const btn = document.getElementById('agy-btn-grant');
-          if (btn) btn.click();
-        } else if (currentStage === 2) {
-          e.preventDefault();
-          e.stopPropagation();
-          const btn = document.getElementById('agy-btn-confirm');
-          if (btn) btn.click();
+          return;
         }
-      } else if (e.key === 'Escape') {
+        if (e.key === 'Tab') {
+          const focusables = Array.from(overlay.querySelectorAll('button:not([disabled]), input:not([disabled])'))
+            .filter((el) => el.offsetParent !== null);
+          if (focusables.length > 0) {
+            const idx = focusables.indexOf(document.activeElement);
+            e.preventDefault();
+            e.stopPropagation();
+            const nextIdx = e.shiftKey
+              ? (idx <= 0 ? focusables.length - 1 : idx - 1)
+              : (idx === -1 || idx >= focusables.length - 1 ? 0 : idx + 1);
+            focusables[nextIdx].focus();
+          } else {
+            e.preventDefault();
+            e.stopPropagation();
+          }
+          return;
+        }
+        if ((e.ctrlKey || e.metaKey || e.altKey) && !chordCaptureMode) {
+          const k = String(e.key || '').toLowerCase();
+          const allowInputEdit = document.activeElement === termPassInput && (e.ctrlKey || e.metaKey) && ['a', 'v', 'c', 'x', 'backspace'].includes(k);
+          if (!allowInputEdit) {
+            e.preventDefault();
+            e.stopPropagation();
+            return;
+          }
+        }
+      }
+
+      if (currentStage === 1 && (e.key === 'Enter' || e.key === ' ')) {
         e.preventDefault();
         e.stopPropagation();
-        finishBoot(true);
+        const btn = document.getElementById('agy-btn-grant');
+        if (btn) btn.click();
+        return;
+      }
+
+      if (currentStage === 2) {
+        if (chordCaptureMode) {
+          if (e.key === 'Escape') {
+            e.preventDefault();
+            e.stopPropagation();
+            resetChordUi();
+            return;
+          }
+          handleChordKeyEvent(e);
+          return;
+        }
+
+        if (activeAuthTab === 'term' && document.activeElement === termPassInput) {
+          if (e.key === 'Escape') {
+            e.preventDefault();
+            e.stopPropagation();
+            termPassInput.value = '';
+          }
+          return;
+        }
+
+        // Instant digit typing (even while Face ID is scanning -> switches straight to Passcode!)
+        if (/^[0-9]$/.test(e.key) && !e.ctrlKey && !e.altKey && !e.metaKey) {
+          e.preventDefault();
+          e.stopPropagation();
+          if (activeAuthTab !== 'pin') {
+            switchAuthTab('pin', 'Manual Passcode entry');
+          }
+          handlePinDigit(e.key);
+          return;
+        }
+
+        if (activeAuthTab === 'pin' && e.key === 'Backspace') {
+          e.preventDefault();
+          e.stopPropagation();
+          pinBuffer = pinBuffer.slice(0, -1);
+          playPinTick(620, 0.04);
+          renderPinOrbs();
+          return;
+        }
+
+        if (activeAuthTab === 'hello' && e.key === 'Enter') {
+          e.preventDefault();
+          e.stopPropagation();
+          triggerWindowsHelloAuth();
+          return;
+        }
+
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          e.stopPropagation();
+          if (!isSkipBlocked()) {
+            finishBoot(true);
+          } else if (activeAuthTab === 'pin' && pinBuffer.length > 0) {
+            pinBuffer = '';
+            renderPinOrbs();
+          }
+          return;
+        }
+        return;
+      }
+
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        if (isSkipBlocked()) {
+          jumpStraightToMfaGate();
+        } else {
+          finishBoot(true);
+        }
       }
     };
     window.addEventListener('keydown', window.__AGY_BOOT_KEYDOWN__, true);
+    isMountingBootOverlay = false;
+    enforceWorkspaceLock();
   }
   window.__ANTIGRAVITY_REPLAY_BOOT__ = () => mountBootSequence(true);
 
-  /** Embed local Mali 500 handwriting WOFF2 subsets once to avoid re-parsing on theme slider drags. */
+  /** Embed offline Plus Jakarta Sans, JetBrains Mono, and Mali WOFF2 subsets once. */
   function ensureGreetingFonts() {
     if (document.getElementById('agy-greeting-font-style')) return;
     const host = document.head || document.documentElement;
     if (!host) return;
-    const subsets = [
-      {
-        src: BOOT_ASSETS.greetingFontVi || resolveMediaUrl('assets/fonts/mali-500-vi.woff2'),
-        range: 'U+0102-0103, U+0110-0111, U+0128-0129, U+0168-0169, U+01A0-01A1, U+01AF-01B0, U+0300-0301, U+0303-0304, U+0308-0309, U+0323, U+0329, U+1EA0-1EF9, U+20AB'
-      },
-      {
-        src: BOOT_ASSETS.greetingFontLatinExt || resolveMediaUrl('assets/fonts/mali-500-latin-ext.woff2'),
-        range: 'U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C4, U+2113, U+2C60-2C7F, U+A720-A7FF'
-      },
-      {
-        src: BOOT_ASSETS.greetingFontLatin || resolveMediaUrl('assets/fonts/mali-500-latin.woff2'),
-        range: 'U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD'
-      }
+    const viRange = 'U+0102-0103, U+0110-0111, U+0128-0129, U+0168-0169, U+01A0-01A1, U+01AF-01B0, U+0300-0301, U+0303-0304, U+0308-0309, U+0323, U+0329, U+1EA0-1EF9, U+20AB';
+    const latinExtRange = 'U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C4, U+2113, U+2C60-2C7F, U+A720-A7FF';
+    const latinRange = 'U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD';
+
+    const faces = [
+      { family: 'Plus Jakarta Sans', weight: '400 700', src: BOOT_ASSETS.jakartaVi || resolveMediaUrl('assets/fonts/jakarta-vi.woff2'), range: viRange },
+      { family: 'Plus Jakarta Sans', weight: '400 700', src: BOOT_ASSETS.jakartaLatinExt || resolveMediaUrl('assets/fonts/jakarta-latin-ext.woff2'), range: latinExtRange },
+      { family: 'Plus Jakarta Sans', weight: '400 700', src: BOOT_ASSETS.jakartaLatin || resolveMediaUrl('assets/fonts/jakarta-latin.woff2'), range: latinRange },
+      { family: 'JetBrains Mono', weight: '500 600', src: BOOT_ASSETS.jbMonoVi || resolveMediaUrl('assets/fonts/jbmono-vi.woff2'), range: viRange },
+      { family: 'JetBrains Mono', weight: '500 600', src: BOOT_ASSETS.jbMonoLatin || resolveMediaUrl('assets/fonts/jbmono-latin.woff2'), range: latinRange },
+      { family: 'AgyTawaMali', weight: '500', src: BOOT_ASSETS.greetingFontVi || resolveMediaUrl('assets/fonts/mali-500-vi.woff2'), range: viRange },
+      { family: 'AgyTawaMali', weight: '500', src: BOOT_ASSETS.greetingFontLatinExt || resolveMediaUrl('assets/fonts/mali-500-latin-ext.woff2'), range: latinExtRange },
+      { family: 'AgyTawaMali', weight: '500', src: BOOT_ASSETS.greetingFontLatin || resolveMediaUrl('assets/fonts/mali-500-latin.woff2'), range: latinRange }
     ];
     const fontEl = document.createElement('style');
     fontEl.id = 'agy-greeting-font-style';
-    fontEl.textContent = subsets.map((s) => `
+    fontEl.textContent = faces.map((f) => `
       @font-face {
-        font-family: 'AgyTawaMali';
+        font-family: '${f.family}';
         font-style: normal;
-        font-weight: 500;
+        font-weight: ${f.weight};
         font-display: swap;
-        src: url("${sanitizeCssUrl(s.src)}") format('woff2');
-        unicode-range: ${s.range};
+        src: url("${sanitizeCssUrl(f.src)}") format('woff2');
+        unicode-range: ${f.range};
       }`).join('\n');
     host.appendChild(fontEl);
   }
 
   function applyTheme(overrides = {}) {
     const st = { ...getState(), ...overrides };
-    if (st.tawaGreeting) ensureGreetingFonts();
+    ensureGreetingFonts();
     try {
       localStorage.setItem(STORAGE_THEME, st.themeName);
       localStorage.setItem(STORAGE_BUBBLE, st.bubbleName);
@@ -2129,7 +3747,9 @@
 
     if (window.agySaveThemeConfig) {
       try {
-        window.agySaveThemeConfig(JSON.stringify(st));
+        const persistObj = { ...st };
+        delete persistObj.authLock;
+        window.agySaveThemeConfig(JSON.stringify(persistObj));
       } catch (e) {}
     }
 
@@ -2236,7 +3856,7 @@
       }
     `;
 
-    const defaultCornerSvg = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Cpath d='M2 20 L2 6 Q2 2 6 2 L20 2' stroke='%23fbbf24' stroke-width='1.5' fill='none' opacity='0.65'/%3E%3Ccircle cx='6' cy='6' r='2' fill='%23fbbf24' opacity='0.75'/%3E%3C/svg%3E";
+    const defaultCornerSvg = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Cpath d='M2 20 L2 6 Q2 2 6 2 L20 2' stroke='%23c084fc' stroke-width='1.5' fill='none' opacity='0.75'/%3E%3Ccircle cx='6' cy='6' r='2' fill='%23e9d5ff' opacity='0.85'/%3E%3C/svg%3E";
     const cornerFiligreeUrl = bubbleTheme.cornerSvg || defaultCornerSvg;
 
     const bubbleStickerCss = bubbleTheme.sticker ? (bubbleTheme.isOrnament ? `
@@ -2343,14 +3963,14 @@
 
     const inputCardBg =
       st.inputStyle === 'glass'
-        ? (bubbleTheme.inputGlassBg || 'rgba(20, 15, 13, 0.52)')
+        ? (bubbleTheme.inputGlassBg || 'rgba(18, 12, 32, 0.54)')
         : st.inputStyle === 'double_gold'
-        ? 'linear-gradient(145deg, rgba(44, 28, 20, 0.90) 0%, rgba(24, 15, 12, 0.92) 100%)'
-        : (bubbleTheme.inputCardBg || 'rgba(28, 19, 16, 0.88)');
+        ? 'linear-gradient(145deg, rgba(28, 16, 48, 0.90) 0%, rgba(12, 8, 24, 0.94) 100%)'
+        : (bubbleTheme.inputCardBg || 'rgba(20, 12, 36, 0.88)');
 
     const inputOuterBorder =
       st.inputStyle === 'double_gold'
-        ? 'linear-gradient(135deg, #f59e0b 0%, rgba(217, 119, 6, 0.35) 50%, #fbbf24 100%)'
+        ? 'linear-gradient(135deg, #f3e8ff 0%, #c084fc 45%, rgba(126, 34, 206, 0.50) 75%, #e879f9 100%)'
         : bubbleTheme.frameBg;
 
     const sidebarBg = mainTheme.sidebarBg || 'rgba(14, 10, 8, 0.68)';
@@ -2860,6 +4480,27 @@
       body[data-has-browser-hole="true"] .agy-shell[data-agy-hole-active="1"] > #agy-live-bg-layer {
         clip-path: var(--agy-hole-clip, none) !important;
       }
+      /* Harmonious Modern Typography (Plus Jakarta Sans + JetBrains Mono) */
+      .agy-shell {
+        font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI Variable Text', 'Segoe UI', sans-serif !important;
+        -webkit-font-smoothing: antialiased;
+      }
+      .agy-shell [data-testid="agent-response"],
+      .agy-shell [data-testid="user-message"] {
+        font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI Variable Text', 'Segoe UI', sans-serif !important;
+        font-size: 15.2px !important;
+        line-height: 1.68 !important;
+      }
+      .agy-shell .surface-composer textarea,
+      .agy-shell .surface-composer [contenteditable="true"] {
+        font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI Variable Text', 'Segoe UI', sans-serif !important;
+        font-size: 15px !important;
+      }
+      .agy-shell :is(pre, code, kbd, samp),
+      .agy-shell [class*="font-mono"] {
+        font-family: 'JetBrains Mono', 'Cascadia Code', Consolas, monospace !important;
+      }
+
       .agy-shell [data-agy-greeting] {
         font-size: 0 !important;
         line-height: 0 !important;
@@ -2868,16 +4509,16 @@
       }
       .agy-shell [data-agy-greeting]::after {
         content: attr(data-agy-greeting);
-        font-family: 'AgyTawaMali', 'Mali', 'Segoe Print', 'Comic Sans MS', cursive !important;
-        font-size: clamp(22px, 2.15vw, 29px) !important;
-        line-height: 1.44 !important;
-        font-weight: 500 !important;
-        color: ${isLight ? '#0f172a' : '#f8fafc'} !important;
-        text-shadow: ${isLight ? '0 1px 2px rgba(255, 255, 255, 0.55)' : '0 2px 15px rgba(0, 0, 0, 0.85), 0 1px 4px rgba(0, 0, 0, 0.65)'} !important;
+        font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI Variable Display', sans-serif !important;
+        font-size: clamp(27px, 2.55vw, 35px) !important;
+        line-height: 1.32 !important;
+        font-weight: 700 !important;
+        letter-spacing: -0.025em !important;
+        color: ${isLight ? '#0f172a' : '#fafafa'} !important;
+        text-shadow: ${isLight ? '0 1px 2px rgba(255, 255, 255, 0.55)' : '0 4px 24px rgba(0, 0, 0, 0.72)'} !important;
         display: block !important;
         text-align: center !important;
-        letter-spacing: 0.01em !important;
-        max-width: 820px;
+        max-width: 840px;
         margin: 0 auto;
         white-space: normal !important;
       }
@@ -2918,6 +4559,7 @@
   }
 
   function removeCustomTheme() {
+    if (!sessionAuthenticated) return;
     clearTitleBarTimers();
     clearRevealRaf();
     teardownBootOverlay();
@@ -3195,6 +4837,49 @@
           </div>
         </div>
 
+        <div style="border: 1px solid ${mainTheme.borderColor}; background: ${mainTheme.cardBg || 'rgba(22, 16, 14, 0.72)'}; border-radius: 12px; padding: 15px 20px; margin-bottom: 24px; display: flex; flex-direction: column; gap: 12px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+            <div>
+              <div style="font-size: 14px; font-weight: 600; color: #f4f4f5; margin-bottom: 2px;">Multi-Factor Security Vault (scrypt · Face ID · PIN · Win Hello · Terminal)</div>
+              <div style="font-size: 12px; color: #a1a1aa;">Credentials are hashed server-side in auth_vault.json (scrypt + CSPRNG token + brute-force lockout).</div>
+            </div>
+            <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+              <label style="display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: #e9d5ff; font-weight: 600; cursor: pointer;">
+                <input id="agy-auth-lock-toggle" type="checkbox" ${st.authLock ? 'checked' : ''} style="accent-color: ${mainTheme.primary}; cursor: pointer;" />
+                Require MFA on Boot
+              </label>
+              <button id="agy-mfa-test-btn" type="button" style="padding: 5px 11px; border-radius: 8px; background: rgba(168, 85, 247, 0.18); border: 1px solid ${mainTheme.borderColor}; color: #f3e8ff; font-size: 12px; font-weight: 600; cursor: pointer;">
+                Test Lock Screen
+              </button>
+              <button id="agy-face-reset-btn" type="button" style="padding: 5px 10px; border-radius: 8px; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.14); color: #d4d4d8; font-size: 12px; cursor: pointer;">
+                Reset Face ID
+              </button>
+            </div>
+          </div>
+          <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding-top: 8px; border-top: 1px solid rgba(255,255,255,0.07);">
+            <span style="font-size: 12px; color: #d8b4fe; font-weight: 600;">Authorize Changes:</span>
+            <input id="agy-cur-pin-auth" type="password" inputmode="numeric" maxlength="6" placeholder="Current 6-digit PIN..." style="width: 190px; background: rgba(0,0,0,0.42); color: #ffffff; border: 1px solid ${mainTheme.borderColor}; border-radius: 8px; padding: 6px 10px; font-family: 'JetBrains Mono', monospace; font-size: 12.5px;" />
+            <span style="font-size: 11.5px; color: #a1a1aa;">Required once per 5 min before changing PIN, passphrase, key chord, or MFA lock.</span>
+          </div>
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 10px; padding-top: 4px;">
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <input id="agy-new-pin-input" type="password" inputmode="numeric" maxlength="6" placeholder="New 6-digit PIN..." style="flex: 1; background: rgba(0,0,0,0.36); color: #ffffff; border: 1px solid ${mainTheme.borderColor}; border-radius: 8px; padding: 6px 10px; font-family: 'JetBrains Mono', monospace; font-size: 12.5px;" />
+              <button id="agy-save-pin-btn" type="button" style="padding: 6px 12px; border-radius: 8px; background: ${mainTheme.primary}; color: #090612; font-weight: 600; font-size: 12px; border: none; cursor: pointer; white-space: nowrap;">Save PIN</button>
+            </div>
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <input id="agy-new-pass-input" type="password" placeholder="New Terminal passphrase..." style="flex: 1; background: rgba(0,0,0,0.36); color: #ffffff; border: 1px solid ${mainTheme.borderColor}; border-radius: 8px; padding: 6px 10px; font-family: 'JetBrains Mono', monospace; font-size: 12.5px;" />
+              <button id="agy-save-pass-btn" type="button" style="padding: 6px 12px; border-radius: 8px; background: rgba(255,255,255,0.12); color: #ffffff; font-weight: 600; font-size: 12px; border: 1px solid rgba(255,255,255,0.18); cursor: pointer; white-space: nowrap;">Save Pass</button>
+            </div>
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <button id="agy-record-chord-btn" type="button" style="flex: 1; padding: 6px 10px; border-radius: 8px; background: rgba(168,85,247,0.16); color: #f3e8ff; font-weight: 600; font-size: 12px; border: 1px solid ${mainTheme.borderColor}; cursor: pointer; white-space: nowrap;">
+                ${serverHasKeyChord ? 'Update 3-Key Chord' : 'Record 3-Key Chord'}
+              </button>
+              <button id="agy-clear-chord-btn" type="button" style="padding: 6px 10px; border-radius: 8px; background: rgba(255,255,255,0.06); color: #d4d4d8; font-size: 12px; border: 1px solid rgba(255,255,255,0.14); cursor: pointer; white-space: nowrap;">Clear</button>
+            </div>
+          </div>
+          <div id="agy-mfa-settings-msg" style="font-size: 11.5px; color: #34d399; min-height: 14px;"></div>
+        </div>
+
         <div style="margin-bottom: 28px;">
           <div style="font-size: 15px; font-weight: 600; color: #ffffff; margin-bottom: 4px;">User Chat Bubble</div>
           <div style="font-size: 12.5px; color: #a1a1aa; margin-bottom: 14px;">Mix and match bubble frame & ornament independently from the active wallpaper.</div>
@@ -3410,10 +5095,10 @@
     }
 
     async function uploadMediaToServer(file, fallbackName) {
-      const base = window.__AGY_MEDIA_BASE_URL__ ? String(window.__AGY_MEDIA_BASE_URL__).replace(/\/+$/, '') : '';
+      const base = getDaemonBaseUrl();
       if (!base) return null;
       try {
-        const resp = await fetch(`${base}/upload?name=${encodeURIComponent(file.name || fallbackName)}`, {
+        const resp = await daemonFetch(`/upload?name=${encodeURIComponent(file.name || fallbackName)}`, {
           method: 'POST',
           headers: { 'Content-Type': file.type || 'application/octet-stream' },
           body: file
@@ -3530,6 +5215,187 @@
       userAvClear.addEventListener('click', () => {
         applyTheme({ userAvatar: 'none' });
         syncAvPreview(userAvPreview, '', 'U');
+      });
+    }
+
+    const authLockToggle = container.querySelector('#agy-auth-lock-toggle');
+    const mfaTestBtn = container.querySelector('#agy-mfa-test-btn');
+    const faceResetBtn = container.querySelector('#agy-face-reset-btn');
+    const curPinAuthInput = container.querySelector('#agy-cur-pin-auth');
+    const newPinInput = container.querySelector('#agy-new-pin-input');
+    const savePinBtn = container.querySelector('#agy-save-pin-btn');
+    const newPassInput = container.querySelector('#agy-new-pass-input');
+    const savePassBtn = container.querySelector('#agy-save-pass-btn');
+    const recordChordBtn = container.querySelector('#agy-record-chord-btn');
+    const clearChordBtn = container.querySelector('#agy-clear-chord-btn');
+    const mfaMsg = container.querySelector('#agy-mfa-settings-msg');
+
+    function showMfaMsg(txt, isError = false) {
+      if (!mfaMsg) return;
+      mfaMsg.style.color = isError ? '#fb7185' : '#34d399';
+      mfaMsg.textContent = txt;
+    }
+
+    async function ensureAdminTicket() {
+      if (!HAS_VAULT_DAEMON) {
+        showMfaMsg('Run .\\scripts\\install-win.ps1 once to activate Hardened Security Vault.', true);
+        return '';
+      }
+      const existing = getValidAdminTicket();
+      if (existing) return existing;
+      const curPin = curPinAuthInput ? curPinAuthInput.value.trim() : '';
+      if (!/^\d{6}$/.test(curPin)) {
+        if (curPinAuthInput) curPinAuthInput.focus();
+        showMfaMsg('Enter your current 6-digit PIN in "Authorize Changes" first.', true);
+        return '';
+      }
+      try {
+        const resp = await daemonFetch('/auth/verify-pin', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ secret: curPin })
+        });
+        const data = await resp.json();
+        if (resp.status === 429 || (data && data.lockedOut)) {
+          showMfaMsg(`Too many failed attempts · Locked for ${data.retryAfterSec || 30}s.`, true);
+          return '';
+        }
+        if (data && data.verified && data.adminTicket) {
+          rememberAdminTicket(data.adminTicket);
+          if (curPinAuthInput) curPinAuthInput.value = '';
+          return data.adminTicket;
+        }
+        showMfaMsg('Current 6-digit PIN is incorrect.', true);
+      } catch (err) {
+        showMfaMsg('Security Vault unreachable.', true);
+      }
+      return '';
+    }
+
+    async function applyVaultPatch(patchObj, successMessage) {
+      const ticket = await ensureAdminTicket();
+      if (!ticket) return false;
+      try {
+        const resp = await daemonFetch('/auth/update-settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ adminTicket: ticket, ...patchObj })
+        });
+        const data = await resp.json();
+        if (!resp.ok || !data || !data.ok) {
+          if (resp.status === 401) lastAdminTicketExp = 0;
+          showMfaMsg((data && data.error) || 'Failed updating vault settings.', true);
+          return false;
+        }
+        serverAuthLock = Boolean(data.authLock);
+        serverHasKeyChord = Boolean(data.hasKeyChord);
+        if (recordChordBtn) {
+          recordChordBtn.textContent = serverHasKeyChord ? 'Update 3-Key Chord' : 'Record 3-Key Chord';
+        }
+        showMfaMsg(successMessage, false);
+        return true;
+      } catch (err) {
+        showMfaMsg('Failed communicating with Security Vault.', true);
+        return false;
+      }
+    }
+
+    if (authLockToggle) {
+      authLockToggle.addEventListener('change', async (e) => {
+        const desired = Boolean(e.target.checked);
+        const ok = await applyVaultPatch(
+          { authLock: desired },
+          desired ? 'Multi-Factor Identity Lock enabled in Vault.' : 'Multi-Factor Identity Lock disabled in Vault.'
+        );
+        if (!ok) {
+          e.target.checked = Boolean(serverAuthLock);
+        }
+      });
+    }
+    if (mfaTestBtn) {
+      mfaTestBtn.addEventListener('click', () => {
+        closeHostModalsForPreview();
+        mountBootSequence(true, true);
+      });
+    }
+    if (faceResetBtn) {
+      faceResetBtn.addEventListener('click', async () => {
+        const ticket = await ensureAdminTicket();
+        if (!ticket) return;
+        try {
+          const resp = await daemonFetch('/auth/face-reset', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ adminTicket: ticket })
+          });
+          const data = await resp.json();
+          if (resp.ok && data && data.ok) {
+            if (data.adminTicket) rememberAdminTicket(data.adminTicket);
+            showMfaMsg('Face ID biometric template cleared. Click Calibrate HD Face on next boot to re-enroll.', false);
+          } else {
+            showMfaMsg((data && data.error) || 'Could not reset Face ID.', true);
+          }
+        } catch (err) {
+          showMfaMsg('Restart daemon once to enable Face ID service.', true);
+        }
+      });
+    }
+    if (savePinBtn && newPinInput) {
+      savePinBtn.addEventListener('click', async () => {
+        const raw = newPinInput.value.trim();
+        if (!/^\d{6}$/.test(raw)) {
+          showMfaMsg('New PIN must be exactly 6 digits (0-9).', true);
+          return;
+        }
+        const ok = await applyVaultPatch({ newPin: raw }, '6-digit Passcode updated (scrypt vault saved).');
+        if (ok) newPinInput.value = '';
+      });
+    }
+    if (savePassBtn && newPassInput) {
+      savePassBtn.addEventListener('click', async () => {
+        const raw = newPassInput.value;
+        if (!raw || raw.length < 4) {
+          showMfaMsg('Passphrase must be at least 4 characters.', true);
+          return;
+        }
+        const ok = await applyVaultPatch({ newPass: raw }, 'Engineer Terminal passphrase updated (scrypt vault saved).');
+        if (ok) newPassInput.value = '';
+      });
+    }
+    if (recordChordBtn) {
+      recordChordBtn.addEventListener('click', async () => {
+        const ticket = await ensureAdminTicket();
+        if (!ticket) return;
+        const recorded = [];
+        recordChordBtn.textContent = 'Press Combo 1/3...';
+        showMfaMsg('Press 3 secret key combinations (Esc to cancel)...', false);
+        const onRecKey = async (ev) => {
+          if (ev.key === 'Escape') {
+            ev.preventDefault();
+            ev.stopPropagation();
+            window.removeEventListener('keydown', onRecKey, true);
+            recordChordBtn.textContent = serverHasKeyChord ? 'Update 3-Key Chord' : 'Record 3-Key Chord';
+            showMfaMsg('Key chord recording cancelled.', true);
+            return;
+          }
+          const combo = serializeKeyCombo(ev);
+          if (!combo) return;
+          ev.preventDefault();
+          ev.stopPropagation();
+          recorded.push(combo);
+          if (recorded.length < 3) {
+            recordChordBtn.textContent = `Press Combo ${recorded.length + 1}/3...`;
+            return;
+          }
+          window.removeEventListener('keydown', onRecKey, true);
+          await applyVaultPatch({ newChord: recorded.join('>') }, `3-Step Secret Key Chord saved (${recorded.join(' -> ')}).`);
+        };
+        window.addEventListener('keydown', onRecKey, true);
+      });
+    }
+    if (clearChordBtn) {
+      clearChordBtn.addEventListener('click', async () => {
+        await applyVaultPatch({ newChord: '' }, 'Secret Key Chord cleared.');
       });
     }
     if (agentAvUpload) {
@@ -3849,10 +5715,10 @@
     async function deleteSavedMediaItem(kind, targetUrl) {
       const isVideo = kind === 'video';
       const isAudio = kind === 'audio';
-      const base = window.__AGY_MEDIA_BASE_URL__ ? String(window.__AGY_MEDIA_BASE_URL__).replace(/\/+$/, '') : '';
+      const base = getDaemonBaseUrl();
       if (base && canonicalMediaKey(targetUrl).startsWith('user_media/')) {
         try {
-          const resp = await fetch(`${base}/delete_media`, {
+          const resp = await daemonFetch('/delete_media', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ url: targetUrl })
@@ -4052,10 +5918,10 @@
     renderTaskVoiceList();
 
     (async () => {
-      const base = window.__AGY_MEDIA_BASE_URL__ ? String(window.__AGY_MEDIA_BASE_URL__).replace(/\/+$/, '') : '';
+      const base = getDaemonBaseUrl();
       if (!base) return;
       try {
-        const resp = await fetch(`${base}/user_media_list`);
+        const resp = await daemonFetch('/user_media_list');
         if (!resp.ok) return;
         const info = await resp.json();
         if (info && info.ok) {
@@ -4413,6 +6279,9 @@
   }
 
   function tick() {
+    if (!sessionAuthenticated) {
+      enforceWorkspaceLock();
+    }
     const activeShell = findActiveShell();
     if (activeShell) {
       const liveLayer = document.getElementById('agy-live-bg-layer');

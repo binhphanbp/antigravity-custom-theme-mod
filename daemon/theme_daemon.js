@@ -7,6 +7,7 @@
  * persists user theme preferences in theme_config.json, and hot-reloads on rebuild.
  */
 
+const { spawn } = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
 const http = require('http');
@@ -19,12 +20,373 @@ if (typeof globalThis.WebSocket !== 'function') {
 }
 
 const ROOT_DIR = path.resolve(__dirname, '..');
-const PID_FILE = path.join(ROOT_DIR, 'daemon.pid');
+const PID_FILE = process.env.AGY_PID_FILE || path.join(ROOT_DIR, 'daemon.pid');
 const CONFIG_FILE = process.env.AGY_CONFIG_PATH || path.join(ROOT_DIR, 'theme_config.json');
 const DIST_DIR = path.join(ROOT_DIR, 'dist');
 const PAYLOAD_PATH = path.join(DIST_DIR, 'theme_payload.js');
-const LOG_FILE = path.join(ROOT_DIR, 'daemon.log');
+const LOG_FILE = process.env.AGY_LOG_FILE || path.join(ROOT_DIR, 'daemon.log');
+const FACE_ENGINE_PY = path.join(__dirname, 'face_engine.py');
+const FACE_PROFILE_FILE = process.env.AGY_FACE_PROFILE_PATH || path.join(ROOT_DIR, 'face_profile.json');
+const VAULT_FILE = process.env.AGY_VAULT_PATH || path.join(ROOT_DIR, 'auth_vault.json');
+const DAEMON_API_TOKEN = process.env.AGY_TEST_API_TOKEN || crypto.randomBytes(32).toString('hex');
 const DEFAULT_CONFIG = {};
+
+const SCRYPT_PARAMS = { N: 16384, r: 8, p: 1 };
+const MAX_FAILED_ATTEMPTS = 5;
+const LOCKOUT_DURATIONS_MS = [30 * 1000, 60 * 1000, 300 * 1000];
+const ADMIN_TICKET_TTL_MS = 5 * 60 * 1000;
+const UNLOCK_PROOF_TTL_MS = 60 * 1000;
+
+const adminTickets = new Map(); // ticketHex -> expiryEpochMs
+const unlockProofs = new Map(); // proofHex -> expiryEpochMs
+let serverFaceMatchStreak = 0;
+
+function scryptHashHex(secret, saltHex) {
+    const saltBuf = Buffer.from(saltHex, 'hex');
+    return crypto.scryptSync(String(secret), saltBuf, 64, SCRYPT_PARAMS).toString('hex');
+}
+
+function timingSafeHexEqual(hexA, hexB) {
+    if (typeof hexA !== 'string' || typeof hexB !== 'string' || hexA.length !== hexB.length || hexA.length % 2 !== 0) {
+        return false;
+    }
+    try {
+        const a = Buffer.from(hexA, 'hex');
+        const b = Buffer.from(hexB, 'hex');
+        if (a.length !== b.length || a.length === 0) return false;
+        return crypto.timingSafeEqual(a, b);
+    } catch (_) {
+        return false;
+    }
+}
+
+function timingSafeTokenEqual(a, b) {
+    if (typeof a !== 'string' || typeof b !== 'string') return false;
+    const bufA = Buffer.from(a, 'utf8');
+    const bufB = Buffer.from(b, 'utf8');
+    if (bufA.length !== bufB.length || bufA.length === 0) return false;
+    return crypto.timingSafeEqual(bufA, bufB);
+}
+
+function createDefaultVault() {
+    const pinSalt = crypto.randomBytes(16).toString('hex');
+    const passSalt = crypto.randomBytes(16).toString('hex');
+    return {
+        version: 1,
+        authLock: true,
+        pinSalt,
+        pinScrypt: scryptHashHex('123456', pinSalt),
+        passSalt,
+        passScrypt: scryptHashHex('binhphan', passSalt),
+        chordSalt: '',
+        chordScrypt: '',
+        failedAttempts: 0,
+        escalationLevel: 0,
+        lockoutUntil: 0,
+    };
+}
+
+function readVault() {
+    try {
+        if (fs.existsSync(VAULT_FILE)) {
+            const parsed = JSON.parse(fs.readFileSync(VAULT_FILE, 'utf8'));
+            if (parsed && typeof parsed === 'object' && parsed.pinScrypt && parsed.passScrypt) {
+                return {
+                    version: 1,
+                    authLock: parsed.authLock !== false,
+                    pinSalt: String(parsed.pinSalt || ''),
+                    pinScrypt: String(parsed.pinScrypt || ''),
+                    passSalt: String(parsed.passSalt || ''),
+                    passScrypt: String(parsed.passScrypt || ''),
+                    chordSalt: String(parsed.chordSalt || ''),
+                    chordScrypt: String(parsed.chordScrypt || ''),
+                    failedAttempts: Number(parsed.failedAttempts) || 0,
+                    escalationLevel: Number(parsed.escalationLevel) || 0,
+                    lockoutUntil: Number(parsed.lockoutUntil) || 0,
+                };
+            }
+        }
+    } catch (_) {}
+    const fresh = createDefaultVault();
+    saveVault(fresh);
+    return fresh;
+}
+
+function saveVault(vaultObj) {
+    try {
+        fs.writeFileSync(VAULT_FILE, JSON.stringify(vaultObj, null, 2), { encoding: 'utf8', mode: 0o600 });
+    } catch (err) {
+        log(`Vault write error: ${err.message}`);
+    }
+}
+
+function issueAuthGrants() {
+    const now = Date.now();
+    for (const [k, exp] of adminTickets.entries()) {
+        if (exp <= now) adminTickets.delete(k);
+    }
+    for (const [k, exp] of unlockProofs.entries()) {
+        if (exp <= now) unlockProofs.delete(k);
+    }
+    const adminTicket = crypto.randomBytes(32).toString('hex');
+    const unlockProof = crypto.randomBytes(32).toString('hex');
+    adminTickets.set(adminTicket, now + ADMIN_TICKET_TTL_MS);
+    unlockProofs.set(unlockProof, now + UNLOCK_PROOF_TTL_MS);
+    return { adminTicket, unlockProof };
+}
+
+function validateAdminTicket(ticket) {
+    if (typeof ticket !== 'string' || ticket.length !== 64) return false;
+    const now = Date.now();
+    for (const [stored, exp] of adminTickets.entries()) {
+        if (exp <= now) {
+            adminTickets.delete(stored);
+            continue;
+        }
+        if (timingSafeHexEqual(stored, ticket)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function consumeUnlockProof(proof) {
+    if (typeof proof !== 'string' || proof.length !== 64) return false;
+    const now = Date.now();
+    for (const [stored, exp] of unlockProofs.entries()) {
+        if (exp <= now) {
+            unlockProofs.delete(stored);
+            continue;
+        }
+        if (timingSafeHexEqual(stored, proof)) {
+            unlockProofs.delete(stored);
+            return true;
+        }
+    }
+    return false;
+}
+
+function verifySecretWithRateLimit(kind, candidate) {
+    const vault = readVault();
+    const now = Date.now();
+    if (vault.lockoutUntil > now) {
+        const retryAfterSec = Math.max(1, Math.ceil((vault.lockoutUntil - now) / 1000));
+        return { ok: true, verified: false, lockedOut: true, retryAfterSec };
+    }
+
+    if (typeof candidate !== 'string' || candidate.length === 0 || candidate.length > 128) {
+        return { ok: true, verified: false, lockedOut: false, remainingAttempts: Math.max(0, MAX_FAILED_ATTEMPTS - vault.failedAttempts) };
+    }
+
+    let matched = false;
+    if (kind === 'pin' && /^\d{6}$/.test(candidate)) {
+        const computed = scryptHashHex(candidate, vault.pinSalt);
+        matched = timingSafeHexEqual(computed, vault.pinScrypt);
+    } else if (kind === 'pass') {
+        const computed = scryptHashHex(candidate, vault.passSalt);
+        matched = timingSafeHexEqual(computed, vault.passScrypt);
+    } else if (kind === 'chord' && vault.chordSalt && vault.chordScrypt) {
+        const computed = scryptHashHex(candidate, vault.chordSalt);
+        matched = timingSafeHexEqual(computed, vault.chordScrypt);
+    }
+
+    if (matched) {
+        if (vault.failedAttempts !== 0 || vault.lockoutUntil !== 0) {
+            vault.failedAttempts = 0;
+            vault.lockoutUntil = 0;
+            vault.escalationLevel = 0;
+            saveVault(vault);
+        }
+        return { ok: true, verified: true, lockedOut: false, ...issueAuthGrants() };
+    }
+
+    vault.failedAttempts += 1;
+    if (vault.failedAttempts >= MAX_FAILED_ATTEMPTS) {
+        const idx = Math.min(LOCKOUT_DURATIONS_MS.length - 1, vault.escalationLevel);
+        const durMs = LOCKOUT_DURATIONS_MS[idx];
+        vault.lockoutUntil = now + durMs;
+        vault.failedAttempts = 0;
+        vault.escalationLevel += 1;
+        saveVault(vault);
+        return {
+            ok: true,
+            verified: false,
+            lockedOut: true,
+            retryAfterSec: Math.ceil(durMs / 1000),
+        };
+    }
+    saveVault(vault);
+    return {
+        ok: true,
+        verified: false,
+        lockedOut: false,
+        remainingAttempts: Math.max(0, MAX_FAILED_ATTEMPTS - vault.failedAttempts),
+    };
+}
+
+let faceWorker = null;
+let faceWorkerBuf = '';
+let faceReqSeq = 1;
+const facePending = new Map();
+
+function ensureFaceWorker() {
+    if (faceWorker && !faceWorker.killed && faceWorker.exitCode === null) {
+        return faceWorker;
+    }
+    const pyBin = process.platform === 'win32' ? 'python' : 'python3';
+    const child = spawn(pyBin, ['-u', FACE_ENGINE_PY], {
+        cwd: ROOT_DIR,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true,
+    });
+    faceWorker = child;
+    faceWorkerBuf = '';
+
+    child.stdout.on('data', (chunk) => {
+        faceWorkerBuf += chunk.toString('utf8');
+        let nlIdx;
+        while ((nlIdx = faceWorkerBuf.indexOf('\n')) !== -1) {
+            const line = faceWorkerBuf.slice(0, nlIdx).trim();
+            faceWorkerBuf = faceWorkerBuf.slice(nlIdx + 1);
+            if (!line) continue;
+            try {
+                const msg = JSON.parse(line);
+                if (msg.id && facePending.has(msg.id)) {
+                    const p = facePending.get(msg.id);
+                    facePending.delete(msg.id);
+                    clearTimeout(p.timer);
+                    p.resolve(msg);
+                }
+            } catch (_) {}
+        }
+    });
+
+    const onExit = () => {
+        if (faceWorker === child) {
+            faceWorker = null;
+        }
+        for (const [id, p] of facePending.entries()) {
+            clearTimeout(p.timer);
+            p.reject(new Error('Face engine exited'));
+            facePending.delete(id);
+        }
+    };
+    child.on('exit', onExit);
+    child.on('error', onExit);
+    return child;
+}
+
+function callFaceEngine(payload, timeoutMs = 8000) {
+    return new Promise((resolve, reject) => {
+        if (!fs.existsSync(FACE_ENGINE_PY)) {
+            resolve({ ok: false, error: 'face_engine.py not found' });
+            return;
+        }
+        let worker;
+        try {
+            worker = ensureFaceWorker();
+        } catch (err) {
+            resolve({ ok: false, error: err.message });
+            return;
+        }
+        const id = faceReqSeq++;
+        const timer = setTimeout(() => {
+            facePending.delete(id);
+            reject(new Error('Face biometric engine timed out'));
+        }, timeoutMs);
+        facePending.set(id, { resolve, reject, timer });
+        try {
+            worker.stdin.write(JSON.stringify({ ...payload, id }) + '\n');
+        } catch (err) {
+            clearTimeout(timer);
+            facePending.delete(id);
+            reject(err);
+        }
+    });
+}
+
+function verifyWindowsHello() {
+    return new Promise((resolve) => {
+        if (process.platform !== 'win32') {
+            resolve({ ok: false, verified: false, error: 'Windows Hello is only supported on Windows.' });
+            return;
+        }
+        const psScript = [
+            '$ErrorActionPreference = "Stop"',
+            'Add-Type -TypeDefinition @"',
+            'using System;',
+            'using System.Runtime.InteropServices;',
+            'public class Win32Fg { [DllImport("user32.dll")] public static extern bool AllowSetForegroundWindow(int dwProcessId); }',
+            '"@ -ErrorAction SilentlyContinue',
+            '[Win32Fg]::AllowSetForegroundWindow(-1) | Out-Null',
+            '$null = [Windows.Security.Credentials.UI.UserConsentVerifier, Windows.Security.Credentials.UI, ContentType = WindowsRuntime]',
+            'Add-Type -AssemblyName System.Runtime.WindowsRuntime',
+            '$asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq "AsTask" -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq "IAsyncOperation`1" })[0]',
+            '$op = [Windows.Security.Credentials.UI.UserConsentVerifier]::RequestVerificationAsync("Antigravity Studio 2.0 - Verify Identity: Binh Phan")',
+            '$task = $asTask.MakeGenericMethod([Windows.Security.Credentials.UI.UserConsentVerificationResult]).Invoke($null, @($op))',
+            '$task.Wait()',
+            'Write-Output ("RESULT:" + $task.Result.ToString())',
+        ].join('\n');
+
+        const child = spawn('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-Command', psScript], {
+            windowsHide: true,
+        });
+        let out = '';
+        let errOut = '';
+        const timer = setTimeout(() => {
+            try { child.kill(); } catch (_) {}
+            resolve({ ok: false, verified: false, error: 'Windows Hello prompt timed out.' });
+        }, 45000);
+        child.stdout.on('data', (d) => { out += d.toString('utf8'); });
+        child.stderr.on('data', (d) => { errOut += d.toString('utf8'); });
+        child.on('close', () => {
+            clearTimeout(timer);
+            const m = out.match(/RESULT:(\w+)/);
+            const status = m ? m[1] : 'Failed';
+            resolve({
+                ok: true,
+                verified: status === 'Verified',
+                status,
+                error: status === 'Verified' ? '' : (errOut.trim() || status),
+            });
+        });
+        child.on('error', (err) => {
+            clearTimeout(timer);
+            resolve({ ok: false, verified: false, error: err.message });
+        });
+    });
+}
+
+function readJsonBody(req, res, maxBytes = 8 * 1024 * 1024) {
+    return new Promise((resolve) => {
+        const chunks = [];
+        let total = 0;
+        let aborted = false;
+        req.on('data', (chunk) => {
+            total += chunk.length;
+            if (total > maxBytes) {
+                aborted = true;
+                res.writeHead(413, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: false, error: 'Payload too large' }));
+                req.destroy();
+                resolve(null);
+                return;
+            }
+            chunks.push(chunk);
+        });
+        req.on('end', () => {
+            if (aborted) return;
+            try {
+                const raw = Buffer.concat(chunks).toString('utf8');
+                resolve(raw ? JSON.parse(raw) : {});
+            } catch (err) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: false, error: 'Invalid JSON body' }));
+                resolve(null);
+            }
+        });
+    });
+}
 
 function resolvePortFile() {
     if (process.env.AGY_PORT_FILE) {
@@ -35,9 +397,13 @@ function resolvePortFile() {
     let candidates;
     if (process.platform === 'win32') {
         const appData = process.env.APPDATA || path.join(home, 'AppData', 'Roaming');
+        const localAppData = process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local');
         candidates = [
-            path.join(appData, 'antigravity', 'DevToolsActivePort'),
             path.join(appData, 'Antigravity', 'DevToolsActivePort'),
+            path.join(appData, 'antigravity', 'DevToolsActivePort'),
+            path.join(localAppData, 'Antigravity', 'DevToolsActivePort'),
+            path.join(localAppData, 'antigravity', 'DevToolsActivePort'),
+            path.join(localAppData, 'Antigravity', 'User Data', 'DevToolsActivePort'),
         ];
     } else if (process.platform === 'darwin') {
         const appSupport = path.join(home, 'Library', 'Application Support');
@@ -116,7 +482,16 @@ function readConfig() {
 
 function saveConfig(next) {
     try {
-        const merged = { ...readConfig(), ...next };
+        const sanitized = { ...(next && typeof next === 'object' ? next : {}) };
+        // Never allow client theme_config.json binding to store or override security credentials
+        delete sanitized.authLock;
+        delete sanitized.authPinHash;
+        delete sanitized.authPassHash;
+        const curr = readConfig();
+        delete curr.authLock;
+        delete curr.authPinHash;
+        delete curr.authPassHash;
+        const merged = { ...curr, ...sanitized };
         fs.writeFileSync(CONFIG_FILE, JSON.stringify(merged, null, 2), 'utf8');
         return merged;
     } catch (err) {
@@ -266,11 +641,27 @@ const MEDIA_MIME = {
     '.bmp': 'image/bmp',
 };
 
+function isAllowedLocalOrigin(originHeader) {
+    if (!originHeader || originHeader === 'null') return true;
+    return /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/i.test(String(originHeader));
+}
+
 function startMediaServer() {
     mediaServer = http.createServer((req, res) => {
-        res.setHeader('Access-Control-Allow-Origin', '*');
+        const origin = req.headers.origin;
+        if (!isAllowedLocalOrigin(origin)) {
+            res.writeHead(403, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'Cross-origin access denied' }));
+            return;
+        }
+        if (origin) {
+            res.setHeader('Access-Control-Allow-Origin', origin);
+            res.setHeader('Vary', 'Origin');
+        } else {
+            res.setHeader('Access-Control-Allow-Origin', 'http://127.0.0.1');
+        }
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range, X-Agy-Token');
 
         if (req.method === 'OPTIONS') {
             res.writeHead(204);
@@ -278,8 +669,210 @@ function startMediaServer() {
             return;
         }
 
+        let pathname = '/';
         const reqUrl = new URL(req.url || '/', 'http://127.0.0.1');
-        const pathname = decodeURIComponent(reqUrl.pathname || '/');
+        try {
+            pathname = decodeURIComponent(reqUrl.pathname || '/');
+        } catch (_) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'Malformed URI' }));
+            return;
+        }
+
+        // Enforce cryptographic per-daemon token on all API / mutating routes
+        const isProtectedApi =
+            pathname.startsWith('/auth/') ||
+            pathname === '/upload' ||
+            pathname === '/delete_media' ||
+            pathname === '/user_media_list';
+        if (isProtectedApi) {
+            const clientTok = String(req.headers['x-agy-token'] || '');
+            if (!timingSafeTokenEqual(clientTok, DAEMON_API_TOKEN)) {
+                res.writeHead(403, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: false, error: 'Invalid or missing X-Agy-Token' }));
+                return;
+            }
+        }
+
+        if (req.method === 'GET' && pathname === '/auth/status') {
+            let source = 'none';
+            let enrolled = false;
+            try {
+                if (fs.existsSync(FACE_PROFILE_FILE)) {
+                    const fp = JSON.parse(fs.readFileSync(FACE_PROFILE_FILE, 'utf8'));
+                    enrolled = Array.isArray(fp.embedding) && fp.embedding.length === 128;
+                    source = fp.source || 'webcam_hd';
+                }
+            } catch (_) {}
+            const vault = readVault();
+            const now = Date.now();
+            const lockedOut = vault.lockoutUntil > now;
+            const retryAfterSec = lockedOut ? Math.max(1, Math.ceil((vault.lockoutUntil - now) / 1000)) : 0;
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                ok: true,
+                authLock: vault.authLock,
+                enrolled,
+                source,
+                hasKeyChord: Boolean(vault.chordScrypt),
+                lockedOut,
+                retryAfterSec,
+                winHelloSupported: process.platform === 'win32',
+            }));
+            return;
+        }
+
+        if (req.method === 'POST' && (pathname === '/auth/verify-pin' || pathname === '/auth/verify-pass' || pathname === '/auth/verify-chord')) {
+            readJsonBody(req, res, 16 * 1024).then((body) => {
+                if (!body) return;
+                const kind = pathname === '/auth/verify-pin' ? 'pin' : (pathname === '/auth/verify-pass' ? 'pass' : 'chord');
+                const secret = typeof body.secret === 'string' ? body.secret : '';
+                const result = verifySecretWithRateLimit(kind, secret);
+                res.writeHead(result.lockedOut ? 429 : 200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify(result));
+            });
+            return;
+        }
+
+        if (req.method === 'POST' && pathname === '/auth/confirm-unlock') {
+            readJsonBody(req, res, 8 * 1024).then((body) => {
+                if (!body) return;
+                const valid = consumeUnlockProof(body.unlockProof);
+                res.writeHead(valid ? 200 : 401, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: valid, unlocked: valid }));
+            });
+            return;
+        }
+
+        if (req.method === 'POST' && pathname === '/auth/face-verify') {
+            readJsonBody(req, res, 6 * 1024 * 1024).then(async (body) => {
+                if (!body) return;
+                try {
+                    const result = await callFaceEngine({ cmd: 'verify', image: body.image || '' }, 10000);
+                    if (result && result.ok && result.matched && !result.staticReplay && !result.tooSmall) {
+                        serverFaceMatchStreak += 1;
+                    } else {
+                        serverFaceMatchStreak = 0;
+                    }
+                    const streakConfirmed = serverFaceMatchStreak >= 3;
+                    const grants = streakConfirmed ? issueAuthGrants() : {};
+                    if (streakConfirmed) {
+                        serverFaceMatchStreak = 0;
+                    }
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({
+                        ...result,
+                        matchStreak: streakConfirmed ? 3 : serverFaceMatchStreak,
+                        streakConfirmed,
+                        ...grants,
+                    }));
+                } catch (err) {
+                    serverFaceMatchStreak = 0;
+                    res.writeHead(500, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: false, error: 'Face verification unavailable' }));
+                }
+            });
+            return;
+        }
+
+        if (req.method === 'POST' && (pathname === '/auth/face-enroll' || pathname === '/auth/face-reset')) {
+            readJsonBody(req, res, 12 * 1024 * 1024).then(async (body) => {
+                if (!body) return;
+                if (!validateAdminTicket(body.adminTicket)) {
+                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: false, error: 'Verification ticket required. Verify current PIN or Windows Hello first.' }));
+                    return;
+                }
+                try {
+                    const cmd = pathname === '/auth/face-enroll'
+                        ? { cmd: 'enroll', images: Array.isArray(body.images) ? body.images : [] }
+                        : { cmd: 'reset' };
+                    const result = await callFaceEngine(cmd, 15000);
+                    const grants = result && result.ok ? issueAuthGrants() : {};
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ...result, ...grants }));
+                } catch (err) {
+                    res.writeHead(500, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: false, error: 'Biometric update failed' }));
+                }
+            });
+            return;
+        }
+
+        if (req.method === 'POST' && pathname === '/auth/update-settings') {
+            readJsonBody(req, res, 32 * 1024).then((body) => {
+                if (!body) return;
+                if (!validateAdminTicket(body.adminTicket)) {
+                    res.writeHead(401, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: false, error: 'Verification required. Verify current PIN, Passphrase, or Windows Hello first.' }));
+                    return;
+                }
+                const vault = readVault();
+                if (typeof body.authLock === 'boolean') {
+                    vault.authLock = body.authLock;
+                }
+                if (typeof body.newPin === 'string' && body.newPin.length > 0) {
+                    if (!/^\d{6}$/.test(body.newPin)) {
+                        res.writeHead(400, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ ok: false, error: 'PIN must be exactly 6 digits (0-9).' }));
+                        return;
+                    }
+                    vault.pinSalt = crypto.randomBytes(16).toString('hex');
+                    vault.pinScrypt = scryptHashHex(body.newPin, vault.pinSalt);
+                }
+                if (typeof body.newPass === 'string' && body.newPass.length > 0) {
+                    if (body.newPass.length < 4 || body.newPass.length > 128) {
+                        res.writeHead(400, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ ok: false, error: 'Passphrase must be 4-128 characters.' }));
+                        return;
+                    }
+                    vault.passSalt = crypto.randomBytes(16).toString('hex');
+                    vault.passScrypt = scryptHashHex(body.newPass, vault.passSalt);
+                }
+                if (typeof body.newChord === 'string') {
+                    if (body.newChord === '') {
+                        vault.chordSalt = '';
+                        vault.chordScrypt = '';
+                    } else if (body.newChord.length >= 6 && body.newChord.length <= 128) {
+                        vault.chordSalt = crypto.randomBytes(16).toString('hex');
+                        vault.chordScrypt = scryptHashHex(body.newChord, vault.chordSalt);
+                    } else {
+                        res.writeHead(400, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ ok: false, error: 'Secret key chord is too short.' }));
+                        return;
+                    }
+                }
+                vault.failedAttempts = 0;
+                vault.lockoutUntil = 0;
+                vault.escalationLevel = 0;
+                saveVault(vault);
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                    ok: true,
+                    authLock: vault.authLock,
+                    hasKeyChord: Boolean(vault.chordScrypt),
+                }));
+            });
+            return;
+        }
+
+        if (req.method === 'POST' && pathname === '/auth/windows-hello') {
+            verifyWindowsHello().then((result) => {
+                const grants = result && result.verified ? issueAuthGrants() : {};
+                if (result && result.verified) {
+                    const vault = readVault();
+                    if (vault.failedAttempts !== 0 || vault.lockoutUntil !== 0) {
+                        vault.failedAttempts = 0;
+                        vault.lockoutUntil = 0;
+                        vault.escalationLevel = 0;
+                        saveVault(vault);
+                    }
+                }
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ...result, ...grants }));
+            });
+            return;
+        }
 
         if (req.method === 'GET' && pathname === '/user_media_list') {
             try {
@@ -380,6 +973,14 @@ function startMediaServer() {
         if (req.method === 'POST' && pathname === '/upload') {
             const rawName = String(reqUrl.searchParams.get('name') || 'custom_media.bin');
             const safeBase = path.basename(rawName).replace(/[^a-zA-Z0-9._-]/g, '_') || 'media.bin';
+            const uploadExt = path.extname(safeBase).toLowerCase();
+            const uploadKind = getMediaKind(safeBase);
+            if (!uploadKind || uploadExt === '.svg') {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: false, error: 'Unsupported media file extension' }));
+                req.resume();
+                return;
+            }
             const fileName = `${Date.now()}_${safeBase}`;
             const chunks = [];
             let total = 0;
@@ -466,6 +1067,8 @@ function startMediaServer() {
         const ext = path.extname(resolved).toLowerCase();
         const mime = MEDIA_MIME[ext] || 'application/octet-stream';
         const range = req.headers.range;
+        res.setHeader('X-Content-Type-Options', 'nosniff');
+        res.setHeader('Content-Security-Policy', "default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'unsafe-inline'");
 
         if (range) {
             const parts = range.replace(/bytes=/, '').split('-');
@@ -497,6 +1100,9 @@ function startMediaServer() {
     mediaServer.listen(0, '127.0.0.1', () => {
         const addr = mediaServer.address();
         mediaPort = addr && typeof addr === 'object' ? addr.port : 0;
+        if (process.env.AGY_TEST_PORT_FILE && mediaPort > 0) {
+            try { fs.writeFileSync(process.env.AGY_TEST_PORT_FILE, String(mediaPort), 'utf8'); } catch (_) {}
+        }
         log(`Local media server listening on http://127.0.0.1:${mediaPort}`);
     });
 }
@@ -512,11 +1118,12 @@ function buildInjectedSource() {
     }
     missingPayloadLogged = false;
 
+    const vault = readVault();
     const cfgJson = JSON.stringify(readConfig());
     const mediaListJson = JSON.stringify(scanUserMedia());
     const mediaBase = mediaPort ? `http://127.0.0.1:${mediaPort}` : '';
     const payloadCode = fs.readFileSync(PAYLOAD_PATH, 'utf8');
-    return `window.__AGY_MEDIA_BASE_URL__ = ${JSON.stringify(mediaBase)};\nwindow.__AGY_INITIAL_CONFIG__ = ${cfgJson};\nwindow.__AGY_USER_MEDIA__ = ${mediaListJson};\n${payloadCode}`;
+    return `window.__AGY_MEDIA_BASE_URL__ = ${JSON.stringify(mediaBase)};\nwindow.__AGY_API_TOKEN__ = ${JSON.stringify(DAEMON_API_TOKEN)};\nwindow.__AGY_AUTH_LOCK__ = ${Boolean(vault.authLock)};\nwindow.__AGY_HAS_CHORD__ = ${Boolean(vault.chordScrypt)};\nwindow.__AGY_INITIAL_CONFIG__ = ${cfgJson};\nwindow.__AGY_USER_MEDIA__ = ${mediaListJson};\n${payloadCode}`;
 }
 
 function getPortInfo() {
@@ -628,6 +1235,15 @@ function createSession(target) {
                 await send('Page.setBypassCSP', { enabled: true });
             } catch (_) {}
             try {
+                const origin = new URL(target.url).origin;
+                if (origin && origin !== 'null') {
+                    await send('Browser.grantPermissions', {
+                        permissions: ['videoCapture', 'audioCapture'],
+                        origin,
+                    });
+                }
+            } catch (_) {}
+            try {
                 await send('Runtime.addBinding', { name: 'agySaveThemeConfig' });
             } catch (_) {}
 
@@ -721,6 +1337,12 @@ function watchPayload() {
 
 function shutdown(signal) {
     log(`Shutting down on ${signal}.`);
+    if (faceWorker) {
+        try {
+            faceWorker.kill();
+        } catch (_) {}
+        faceWorker = null;
+    }
     if (mediaServer) {
         try {
             mediaServer.close();

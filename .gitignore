@@ -1,14 +1,16 @@
-# Build & runtime outputs
+# Build & runtime outputs (private per-machine state)
 dist/
 daemon.log
 daemon.pid
 theme_config.json
+auth_vault.json
+face_profile.json
 silent-start.vbs
 TAWA_MOD_NOTES.md
 
-# Private user media uploads (keep only the sample task-completion voice)
+# Private user media uploads (keep only the default Studio Glass Chime audio)
 themes/user_media/*
-!themes/user_media/1795011944060_Tawa_voice_task_1.mp3
+!themes/user_media/1795090000000_Studio_Glass_Chime.mp3
 
 # OS / Python / Node junk
 __pycache__/

@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 136 38" fill="none">
+  <defs>
+    <linearGradient id="aeArcMetal" x1="0%" y1="50%" x2="100%" y2="50%">
+      <stop offset="0%" stop-color="#581c87" stop-opacity="0.05"/>
+      <stop offset="22%" stop-color="#a855f7" stop-opacity="0.82"/>
+      <stop offset="50%" stop-color="#f3e8ff" stop-opacity="1"/>
+      <stop offset="78%" stop-color="#c084fc" stop-opacity="0.82"/>
+      <stop offset="100%" stop-color="#38bdf8" stop-opacity="0.08"/>
+    </linearGradient>
+    <linearGradient id="aeChrome" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="35%" stop-color="#e9d5ff"/>
+      <stop offset="70%" stop-color="#a855f7"/>
+      <stop offset="100%" stop-color="#6b21a8"/>
+    </linearGradient>
+    <linearGradient id="aeCyanRim" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.2"/>
+      <stop offset="50%" stop-color="#e879f9" stop-opacity="0.95"/>
+      <stop offset="100%" stop-color="#38bdf8" stop-opacity="0.2"/>
+    </linearGradient>
+  </defs>
+  <!-- Sweeping metallic amethyst wing arc -->
+  <path d="M 6 30 Q 68 6 130 30" stroke="url(#aeArcMetal)" stroke-width="1.5" stroke-linecap="round"/>
+  <!-- Inner futuristic telemetry orbit -->
+  <path d="M 22 33 Q 68 13 114 33" stroke="url(#aeCyanRim)" stroke-width="0.9" stroke-dasharray="3 3" opacity="0.72"/>
+  <!-- Futuristic quantum singularity ring crest at center -->
+  <g transform="translate(68, 17)">
+    <ellipse cx="0" cy="0" rx="14" ry="4.5" transform="rotate(-14)" stroke="url(#aeChrome)" stroke-width="1.25" opacity="0.92"/>
+    <circle cx="0" cy="0" r="6.2" fill="#070510" stroke="url(#aeChrome)" stroke-width="1.2"/>
+    <path d="M 0 -11.5 L 1.6 -3.0 L 11.5 0 L 1.6 3.0 L 0 11.5 L -1.6 3.0 L -11.5 0 L -1.6 -3.0 Z" fill="url(#aeChrome)"/>
+    <circle cx="0" cy="0" r="1.8" fill="#ffffff"/>
+  </g>
+  <!-- Angular cyber-chrome chevrons & quantum nodes -->
+  <path d="M 41 21 L 47 17 L 45 22 Z" fill="#e9d5ff" opacity="0.88"/>
+  <path d="M 95 21 L 89 17 L 91 22 Z" fill="#e9d5ff" opacity="0.88"/>
+  <circle cx="33" cy="23" r="1.5" fill="#c084fc"/>
+  <circle cx="103" cy="23" r="1.5" fill="#38bdf8"/>
+  <path d="M 20 26 L 21 23.5 L 23.5 22.5 L 21 21.5 L 20 19 L 19 21.5 L 16.5 22.5 L 19 23.5 Z" fill="#f3e8ff" opacity="0.9"/>
+  <path d="M 116 26 L 117 23.5 L 119.5 22.5 L 117 21.5 L 116 19 L 115 21.5 L 112.5 22.5 L 115 23.5 Z" fill="#e879f9" opacity="0.9"/>
+</svg>

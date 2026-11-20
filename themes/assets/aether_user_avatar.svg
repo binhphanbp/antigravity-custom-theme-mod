@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none">
+  <defs>
+    <radialGradient id="uvBg" cx="50%" cy="32%" r="72%">
+      <stop offset="0%" stop-color="#231338"/>
+      <stop offset="60%" stop-color="#0b0714"/>
+      <stop offset="100%" stop-color="#050309"/>
+    </radialGradient>
+    <linearGradient id="uvMetal" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="30%" stop-color="#e9d5ff"/>
+      <stop offset="65%" stop-color="#a855f7"/>
+      <stop offset="100%" stop-color="#581c87"/>
+    </linearGradient>
+    <linearGradient id="uvAccent" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="50%" stop-color="#c084fc"/>
+      <stop offset="100%" stop-color="#f3e8ff"/>
+    </linearGradient>
+  </defs>
+  <circle cx="64" cy="64" r="61.5" fill="url(#uvBg)" stroke="url(#uvMetal)" stroke-width="2.8"/>
+  <circle cx="64" cy="64" r="53" stroke="url(#uvAccent)" stroke-width="1.0" stroke-dasharray="5 4" opacity="0.55"/>
+  <!-- Futuristic Hexagonal Cyber-Architect Crest -->
+  <polygon points="64,18 102,40 102,88 64,110 26,88 26,40" fill="rgba(168,85,247,0.10)" stroke="url(#uvMetal)" stroke-width="2.2" stroke-linejoin="round"/>
+  <!-- Inner Metallic Chevron Visor & Quantum Core -->
+  <path d="M 36 52 L 64 68 L 92 52 L 84 78 L 64 90 L 44 78 Z" fill="rgba(192,132,252,0.18)" stroke="url(#uvAccent)" stroke-width="2.2" stroke-linejoin="round"/>
+  <path d="M 64 26 L 67.5 47 L 88 50.5 L 67.5 54 L 64 75 L 60.5 54 L 40 50.5 L 60.5 47 Z" fill="url(#uvMetal)"/>
+  <circle cx="64" cy="50.5" r="4" fill="#ffffff"/>
+</svg>

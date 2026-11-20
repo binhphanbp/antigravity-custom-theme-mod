@@ -1,145 +1,92 @@
-# Antigravity Custom Theme Mod
+# Antigravity Studio 2.0 — Aether Metallic Violet & Biometric MFA Edition
 
-Trình tùy biến giao diện nền động, màn hình khởi động và hiệu ứng kính mờ cho **Antigravity** mà không can thiệp vào tệp cài đặt gốc (`app.asar`) của ứng dụng.
-
-![Minh họa giao diện Antigravity Custom Theme](docs/demo.webp)
-
-> Mã nguồn này được phát triển và mở rộng dựa trên dự án mã nguồn mở [antigravity-custom-theme-skill](https://github.com/giakiet22102006/antigravity-custom-theme-skill) (giấy phép MIT).
+Custom high-craft **Metallic Violet / Amethyst Chrome** UI engine, Studio Cinematic Sci-Fi audio suite, and **4-Method Multi-Factor Biometric Security Vault** for **Antigravity 2.0** — engineered for **`Binh Phan` (`BINHPHAN-SOFTWARE-ENGINEER`)** without modifying `app.asar`.
 
 ---
 
-## Giới thiệu mã nguồn
+## Key Highlights
 
-Hệ thống vận hành theo mô hình hai lớp tách biệt nhằm giữ ổn định khi Antigravity cập nhật phiên bản mới:
-
-1. **Daemon nền và Media Server nội bộ (`daemon/theme_daemon.js`):**
-   - Chạy nền trên máy, tự động dò tệp `DevToolsActivePort` của Antigravity và kết nối qua Chrome DevTools Protocol (CDP).
-   - Mở HTTP Server cục bộ trên `127.0.0.1` (cổng ngẫu nhiên) để phục vụ tài nguyên trong `themes/assets/` và `themes/user_media/` (hỗ trợ phát video theo dải byte `Range 206`, tải lên tệp mới kèm kiểm tra trùng lặp theo mã băm MD5 và xóa tệp trên ổ đĩa).
-   - Theo dõi thay đổi ở `dist/theme_payload.js` để nạp lại giao diện tức thì và đồng bộ thiết lập của người dùng vào `theme_config.json`.
-
-2. **Bộ máy giao diện runtime (`engine/core.js`):**
-   - Sau khi được `scripts/build_payload.py` đóng gói cùng `themes/themes.json` thành `dist/theme_payload.js`, script được tiêm vào cửa sổ Antigravity để dựng lớp nền `<agy-live-bg>`, bảng điều khiển **Custom Theme Studio**, màn hình khởi động Starfield Boot HUD và hiệu ứng vẽ nét trước khi loang màu nền.
-   - Sử dụng ảnh kính mờ dựng sẵn (`syncPrebakedGlass`) kết hợp giới hạn bộ nhớ đệm và giải phóng bộ giải mã video khi chuyển sang chế độ ảnh tĩnh để giảm tiêu thụ RAM.
-
----
-
-## Tính năng chính
-
-- **Chế độ nền Ảnh tĩnh và Video động tách biệt:** Quản lý riêng danh sách ảnh tĩnh và video đã tải lên; tự động lưu lịch sử mỗi khi chọn tệp mới, hỗ trợ xem trước và xóa trực tiếp từng mục khỏi ổ cứng.
-- **Preset mặc định đi kèm:** Bao gồm `Gemini-chan Live` (`themes/assets/wallpapergeminichan.mp4`), `Furina Live` (`themes/assets/furina-bg.mp4`), `WLOP Cosmic` và `Midnight Obsidian`.
-- **Hiệu ứng vẽ nét và loang màu (Sketch Reveal):** Trích xuất đường nét trực tiếp từ khung hình video hoặc ảnh nền hiện tại qua thuật toán biên cạnh đa kênh màu kết hợp làm mượt đường cong.
-- **Màn hình khởi động (Boot HUD):** Giao diện khởi động kèm âm thanh điều hướng, có thể bật/tắt hoặc phát lại từ bảng cài đặt.
-- **Câu chào tùy chỉnh (Custom Greeting):** Cho phép tự soạn danh sách câu chào ngẫu nhiên hiển thị trên màn hình hội thoại trống bằng bộ phông chữ viết tay đóng gói ngoại tuyến.
-- **Âm thanh báo hoàn thành tác vụ (Task Voice):** Hỗ trợ nạp nhiều tệp âm thanh (`.mp3`, `.wav`, `.ogg`, `.m4a`, `.aac`, `.flac`), phát ngẫu nhiên khi tác vụ kết thúc và giải phóng đối tượng âm thanh ngay sau khi phát xong.
-- **Tùy biến khung chat và ảnh đại diện:** Thay đổi khung nhập liệu, bong bóng tin nhắn, ảnh đại diện User/Agent (tự nén WebP), độ tối nền và độ mờ kính.
+- **Aether Metallic Violet Design System:**
+  - Custom 3D obsidian-amethyst metallic ribbon backdrop (`aether_metallic_violet.webp`), bespoke metallic filigree SVGs, pre-baked 120fps frosted glass (`syncPrebakedGlass`), and offline `Plus Jakarta Sans` + `JetBrains Mono` typography.
+- **4-Method Multi-Factor Identity Verification Hub (Boot Gate):**
+  1. **AI Face ID (Primary Default):** 100% offline OpenCV Zoo **YuNet** (5-landmark detection) + **SFace INT8** (128-D embedding) running on ONNX Runtime CPU with 3-frame liveness streak & rolling 8-frame anti-static-replay protection. Automatically falls back to **6-Digit Passcode** if the camera is off, covered, or dark.
+  2. **6-Digit Stealth Passcode:** Keyboard & tactile keypad entry backed by server-side `crypto.scrypt` hashing.
+  3. **Windows Hello Hardware Security:** Native Windows `UserConsentVerifier` integration (Fingerprint, IR Face, or Windows PIN).
+  4. **Engineer Terminal & 3-Step Secret Key Chord:** Masked passphrase verification + configurable 3-combo secret key sequence.
+- **Hardened Local Security Architecture:**
+  - Zero client-side credential hashes; secrets are stored exclusively in `auth_vault.json` (`0600`) using `scrypt` (`N=16384, r=8, p=1`) + random 128-bit salts + `crypto.timingSafeEqual`.
+  - Ephemeral 256-bit per-session `X-Agy-Token` authentication, strict `127.0.0.1` Origin enforcement, single-use `unlockProof`, time-scoped `adminTicket` for settings rotation, exponential brute-force lockout (`429`), and `MutationObserver` + `inert` DOM workspace isolation.
+- **Studio Cinematic Sci-Fi Audio:**
+  - Studio-grade sci-fi boot sound design (`cyber_voice1.mp3` – `cyber_voice4.mp3`) and task-completion glass chime (`Studio_Glass_Chime.mp3`).
 
 ---
 
-## Yêu cầu hệ thống
+## Requirements
 
-- **Antigravity** đang hoạt động với cổng gỡ lỗi CDP (`DevToolsActivePort`).
-- **Node.js từ phiên bản 22 trở lên** (sử dụng `WebSocket` tích hợp sẵn, không cần chạy `npm install`).
-- **Python từ phiên bản 3.9 trở lên** để biên dịch `dist/theme_payload.js` (khuyến nghị cài thêm thư viện `Pillow` nếu muốn tự động nén ảnh nền độ phân giải cao sang WebP).
+- **Node.js >= 22** (uses built-in `WebSocket`, zero `npm install` needed).
+- **Python >= 3.10** with `Pillow`, `numpy`, and `onnxruntime` (`pip install pillow numpy onnxruntime`).
 
 ---
 
-## Hướng dẫn cài đặt và sử dụng
-
-### Bước 1: Tải mã nguồn
-
-```bash
-git clone https://github.com/furinamikuvn/antigravity-custom-theme-mod.git
-cd antigravity-custom-theme-mod
-```
-
-### Bước 2: Biên dịch gói giao diện (`dist/theme_payload.js`)
-
-```bash
-python scripts/build_payload.py
-```
-
-Kiểm tra nhanh cú pháp sau khi biên dịch:
-
-```bash
-node --check dist/theme_payload.js
-```
-
-### Bước 3: Cài đặt và khởi chạy daemon nền
-
-**Trên Windows (PowerShell):**
+## Quick Start (Windows)
 
 ```powershell
+git clone https://github.com/binhphanbp/antigravity-custom-theme-mod.git
+cd antigravity-custom-theme-mod
+
+# 1. Build dist/theme_payload.js
+python scripts/build_payload.py
+
+# 2. Configure permanent Windows Startup & Antigravity CDP shortcut (--remote-debugging-port=0)
+powershell -ExecutionPolicy Bypass -File ".\scripts\setup-permanent.ps1"
+
+# 3. Restart / launch background daemon anytime
 powershell -ExecutionPolicy Bypass -File ".\scripts\install-win.ps1"
 ```
 
-Lệnh trên tạo tệp `silent-start.vbs` cùng lối tắt khởi động trong thư mục `Startup` của Windows (`AntigravityCustomTheme.lnk`) và chạy daemon ngầm không hiện cửa sổ dòng lệnh. Khi tắt hoặc mở lại Antigravity, giao diện sẽ tự động được nạp lại.
-
-Nếu muốn chạy trực tiếp `.\scripts\install-win.ps1` ở các lần sau mà không cần thêm `-ExecutionPolicy Bypass`, có thể mở khóa chính sách script cho người dùng hiện tại một lần bằng lệnh:
+Verify active CDP injection:
 
 ```powershell
-Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
-```
-
-**Trên macOS / Linux (Bash):**
-
-```bash
-bash scripts/install-unix.sh
-```
-
-- Trên **macOS**: cài đặt LaunchAgent tại `~/Library/LaunchAgents/io.antigravity.custom-theme.plist`.
-- Trên **Linux**: cài đặt dịch vụ `systemd --user` (hoặc chạy nền qua `nohup`).
-- Có thể dùng cờ `--foreground` để chạy trực tiếp trên terminal khi kiểm thử, hoặc `stop` / `status` để dừng và xem trạng thái.
-
-### Bước 4: Kiểm tra trạng thái nạp qua CDP
-
-Khi cửa sổ Antigravity đang mở, chạy lệnh:
-
-```bash
-node scripts/verify_cdp.js
-```
-
-Kết quả đạt yêu cầu sẽ báo `PASS` kèm thông tin số trang đã được áp dụng giao diện. Để mở bảng tùy chỉnh giao diện trong Antigravity, bấm mục **Custom theme** ở thanh bên trái hoặc nút **Open Custom Theme Studio** trong phần cài đặt **Appearance**.
-
----
-
-## Gỡ cài đặt
-
-Để dừng daemon nền, xóa lối tắt tự khởi động và trả giao diện Antigravity về trạng thái mặc định:
-
-```bash
-node scripts/uninstall.js
+node .\scripts\verify_cdp.js
 ```
 
 ---
 
-## Cấu trúc thư mục
+## Security Vault Configuration
+
+On first launch, `daemon/theme_daemon.js` initializes a local `auth_vault.json` (git-ignored). Open **Sidebar → `Custom theme` → `Multi-Factor Security Vault`**, enter your current PIN in **Authorize Changes**, and customize:
+- **6-Digit Passcode**
+- **Engineer Terminal Passphrase**
+- **3-Step Secret Key Chord**
+- **HD Face ID Calibration** (via `Calibrate HD Face ID` on the boot lock screen)
+
+---
+
+## Project Structure
 
 ```text
 .
 ├── daemon/
-│   └── theme_daemon.js        # Daemon kết nối CDP, HTTP Media Server và lưu cấu hình
+│   ├── theme_daemon.js        # CDP injector, scrypt Security Vault & protected Media Server
+│   ├── face_engine.py         # Offline YuNet + SFace INT8 biometric engine with anti-replay
+│   └── models/                # Bundled yunet.onnx & sface_int8.onnx models
 ├── engine/
-│   └── core.js                # Mã nguồn giao diện runtime, Boot HUD, Sketch Reveal, Modal
+│   └── core.js                # Runtime UI engine, Boot MFA Hub, Tamper Guard & Theme Studio
 ├── scripts/
-│   ├── build_payload.py       # Trình đóng gói themes.json + core.js -> dist/theme_payload.js
-│   ├── install-win.ps1        # Script cài đặt và chạy ngầm trên Windows
-│   ├── install-unix.sh        # Script cài đặt trên macOS / Linux
-│   ├── uninstall.js           # Gỡ dịch vụ nền và khôi phục giao diện gốc
-│   └── verify_cdp.js          # Kiểm tra trạng thái tiêm giao diện qua CDP
-├── themes/
-│   ├── themes.json            # Khai báo các preset giao diện mặc định
-│   ├── assets/                # Video, poster, phông chữ và âm thanh mặc định
-│   └── user_media/            # Tệp người dùng tải lên (kèm sẵn 1 mẫu voice hoàn thành task)
-├── docs/
-│   └── demo.webp              # Ảnh động minh họa giao diện cho README
-├── references/
-│   └── theme-schema.md        # Tài liệu cấu trúc dữ liệu themes.json
-├── SKILL.md                   # Đặc tả cấu trúc Skill
-└── LICENSE                    # Giấy phép MIT
+│   ├── build_payload.py       # Compiles themes.json + offline assets + core.js -> dist/
+│   ├── setup-permanent.ps1    # Configures Windows Startup + Antigravity CDP shortcuts
+│   ├── install-win.ps1        # Starts/restarts silent Windows background daemon
+│   ├── install-unix.sh        # macOS / Linux daemon installer
+│   ├── verify_cdp.js          # Verifies live CDP connection
+│   └── uninstall.js           # Stops daemon and restores default UI
+└── themes/
+    ├── themes.json            # Theme presets (Aether Metallic Violet default)
+    ├── assets/                # Wallpapers, custom SVGs, WOFF2 fonts, studio sci-fi audio
+    └── user_media/            # Default Studio Glass Chime (private uploads git-ignored)
 ```
 
 ---
 
-## Giấy phép
+## License
 
-Phát hành theo giấy phép **MIT** — xem chi tiết trong tệp [LICENSE](LICENSE).
+Released under the [MIT License](LICENSE). Based on [antigravity-custom-theme-mod](https://github.com/furinamikuvn/antigravity-custom-theme-mod) / [antigravity-custom-theme-skill](https://github.com/giakiet22102006/antigravity-custom-theme-skill).
