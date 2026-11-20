@@ -99,12 +99,30 @@
       body[data-agy-mfa-locked="1"] .agy-shell,
       body[data-agy-mfa-locked="1"] .settings-modal-container,
       body[data-agy-mfa-locked="1"] #agy-custom-theme-modal-backdrop {
-        visibility: hidden !important;
+        opacity: 0 !important;
         pointer-events: none !important;
         user-select: none !important;
       }
     `;
     host.appendChild(st);
+  }
+
+  function nudgeComposerLayout() {
+    const syncOnce = () => {
+      try {
+        document.querySelectorAll('.surface-composer-card textarea').forEach((ta) => {
+          if (!ta.value && ta.style && ta.style.height && parseFloat(ta.style.height) < 26) {
+            ta.style.height = '';
+          }
+        });
+        if (typeof Event === 'function') {
+          window.dispatchEvent(new Event('resize'));
+        }
+      } catch (e) {}
+    };
+    syncOnce();
+    setTimeout(syncOnce, 80);
+    setTimeout(syncOnce, 260);
   }
 
   function enforceWorkspaceLock() {
@@ -170,6 +188,7 @@
       sh.inert = false;
       sh.removeAttribute('aria-hidden');
     });
+    nudgeComposerLayout();
   }
 
   function stopAuthCamera() {
@@ -1336,6 +1355,7 @@
 
   function scheduleRevealWhenReady(allowInstant = false) {
     window.__AGY_BOOT_FINISHED__ = true;
+    nudgeComposerLayout();
     const shell = findActiveShell();
     if (shell) {
       const liveLayer = document.getElementById('agy-live-bg-layer');
@@ -4374,11 +4394,30 @@
         position: relative !important;
       }
 
+      /* New Conversation / Empty state has a top context bar (project & branch selectors) above .surface-composer-card:
+         use a sleek smoked glass tray instead of painting bright border gradient behind the top strip */
+      .surface-composer:has(> :not(.surface-composer-card)) {
+        background: linear-gradient(180deg, rgba(${overlayRgb}, 0.78) 0%, rgba(${overlayRgb}, 0.90) 100%) !important;
+        border: 1px solid ${bubbleTheme.borderColor || 'rgba(192, 132, 252, 0.36)'} !important;
+        padding: 5px 6px 6px 6px !important;
+      }
+
       .surface-composer-card {
         background: ${inputCardBg} !important;
         backdrop-filter: none !important;
         border-radius: 14.5px !important;
         border: ${bubbleTheme.innerBorder || '1px solid rgba(255, 255, 255, 0.07)'} !important;
+      }
+
+      .surface-composer:has(> :not(.surface-composer-card)) > .surface-composer-card {
+        border-radius: 12px !important;
+        border: 1px solid ${bubbleTheme.borderColor || 'rgba(192, 132, 252, 0.30)'} !important;
+      }
+
+      /* Guarantee input region above bottom model toolbar never collapses on initial mount */
+      .surface-composer-card > :has(+ [data-testid="input-box-bottom-toolbar"]) {
+        min-height: 40px !important;
+        box-sizing: border-box !important;
       }
 
       /* High-contrast pill badges for top composer bar (adaptive light/dark theme) */
@@ -4491,10 +4530,12 @@
         font-size: 15.2px !important;
         line-height: 1.68 !important;
       }
-      .agy-shell .surface-composer textarea,
+      .agy-shell .surface-composer textarea:not(.inputarea),
       .agy-shell .surface-composer [contenteditable="true"] {
         font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI Variable Text', 'Segoe UI', sans-serif !important;
         font-size: 15px !important;
+        line-height: 1.5 !important;
+        min-height: 26px !important;
       }
       .agy-shell :is(pre, code, kbd, samp),
       .agy-shell [class*="font-mono"] {
